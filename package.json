@@ -1,0 +1,14 @@
+{
+  "name": "repair-logistics-control-tower",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Control tower for repair logistics: SLA rules per shipment stage, aging, escalation workflow and working capital at risk.",
+  "workspaces": ["server", "client"],
+  "scripts": {
+    "dev": "npm run dev -w server & npm run dev -w client",
+    "build": "npm run build -w client && npm run build -w server",
+    "start": "npm run start -w server",
+    "test": "npm test -w server && npm test -w client",
+    "typecheck": "npm run typecheck -w server && npm run typecheck -w client"
+  }
+}
