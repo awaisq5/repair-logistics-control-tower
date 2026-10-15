@@ -1,53 +1,86 @@
 # Repair logistics control tower
 
-A control tower for **repair logistics**: high-value tools that fail in the field, travel to a repair centre, get fixed and travel back. Every stage of that loop has its own service level. This app shows which shipments are stuck, opens escalations automatically, gives each escalation an owner, and tracks the working capital that starts moving again once a shipment is unblocked.
+Serialized tools that fail in the field go into a **repair & return (R&R) loop**: they wait to ship at the sending location, travel to a repair hub, get booked in and repaired, wait to ship out, and travel back. Every one of those steps can stall, and a stalled tool is working capital nobody can use.
 
-![Dashboard with the verdict sentence, KPIs and the aging board](docs/screenshot.png)
+This app tracks every unit through the loop's six stages, learns from history how long each stage normally takes **on each lane**, flags the units that are beyond that normal variation, and runs the escalation workflow until they move again.
 
-## Why I built it
+![Live view: value in transit and pending, the six-stage loop, and pending units by country](docs/live.png)
 
-In a supply chain rotation I owned KPI reporting for a global repair logistics network: more than 10,000 shipments a year and over $12M in shipment value. We cut stagnant shipments by 18% and released $1.5M in working capital by introducing service-level thresholds and an escalation workflow. That workflow ran on a Power BI report and email. This project is the tool I would build for it: the thresholds live in one place, escalations open themselves, and every escalation has an owner and a history.
+## Where this comes from
 
-## What it does
+In my third rotation in a supply chain leadership programme I worked on global repair logistics optimisation. I validated several candidate datasets, built a Power BI dashboard on the real-time and historic R&R shipments, automated the data refresh and the estimation of days per logistics stage, and defined service levels to catch critical delays. A control chart of shipment days by country showed which locations were consistently out of line, and talking to the regional logistics teams turned those signals into actions (one lane's shipment was expedited the same week). The dashboard tracked more than $5.8M of high-value items in transit and about $6M pending at sending locations.
 
-- **SLA per stage.** Awaiting pickup, transit, customs, awaiting repair, in repair, return transit. Each stage has its own warning, escalation and critical thresholds, editable in the app.
-- **High-value rule.** Shipments above a value threshold jump one level as soon as they breach, because a stuck €180k steering unit matters more than a stuck battery pack.
-- **Aging board.** One row per stage, one tick per shipment placed by days in stage, drawn over that stage's SLA zones. You see at a glance where the network is clogged.
-- **Escalation queue.** A scan, run every 15 minutes and on demand, opens one escalation per breaching shipment and raises it when the shipment gets worse. Someone takes ownership with a first action. Moving the shipment resolves the escalation automatically and counts its value as released.
-- **Carrier and repair-centre breakdowns** of who holds the most value past SLA.
-- **KPIs:** value in the repair loop, capital released in the last 30 days, share of stage moves inside SLA, average turnaround.
+This project rebuilds that method as an application: the same six stages, the same lane and country views, and the control-chart logic built in, so the escalation workflow runs on top of it instead of beside it. **All data in this repository is synthetic.** Countries are real so the lanes read naturally; every location, serial number, value and duration is generated.
 
-<img src="docs/shipment-detail.png" alt="Shipment detail with waybill fields, move action and journey timeline" width="420" />
+## The six stages
+
+| # | Stage | Starts at | Ends at | Limits grouped by |
+|---|---|---|---|---|
+| 1 | Pending at sending location | unit ready to ship | dispatch | sending country |
+| 2 | In transit to repair hub | dispatch | goods receipt (GR) at hub | lane (country → hub) |
+| 3 | GR to work order | goods receipt | work order (WO) opened | repair hub |
+| 4 | In repair | work order opened | repair finished | repair hub |
+| 5 | Waiting to ship out | repair finished | dispatch from hub | repair hub |
+| 6 | In transit back | dispatch from hub | receipt at destination | lane (hub → country) |
+
+Each stage is grouped by where its delay actually comes from: waiting to ship is a sending-country problem, booking-in and repair are hub problems, transit is a lane problem.
+
+## From fixed service levels to control limits
+
+A single service level ("escalate after 14 days in transit") treats a short European lane and a customs-heavy West African lane the same, so it is either too loose for one or too noisy for the other. Instead, every stage and group gets its own limits from the last 12 months of completed units, using an individuals (I-MR) control chart:
+
+```
+centre line  = average days
+UCL          = average + 2.66 × average moving range
+```
+
+A unit above its UCL has been in its stage longer than that lane's normal variation explains: a **special cause**, worth a call to the regional logistics owner. The chart also flags sustained shifts (eight completed units in a row above average), which point to a lane problem rather than a single unit. Groups with fewer than eight completed units fall back to the limits of the whole stage.
+
+![Control chart by sending country: each group with its own centre line and limits, special causes in red](docs/control-chart.png)
+
+## What the app does
+
+- **Live view.** Units and value in each of the six stages, the average days pending and in transit by country (the two live charts of the original dashboard), and every unit beyond its limit.
+- **Lanes.** Average days per stage for every country-to-hub lane, stacked, so you can see whether a lane is slow because of the sending country, the road, or the hub.
+- **Control charts.** The I-chart per stage, grouped by country, lane or hub, with special causes highlighted and a week-by-week count of units beyond their limit.
+- **Escalations.** A scan, run every 15 minutes and on demand, opens one escalation per unit beyond its limit and suggests the regional logistics owner for that location. Recording the unit's next movement closes the escalation and counts its value as working capital moving again.
+- **Load data.** Upload a movement export with seven dates per unit. Every row is checked first: dates out of order, gaps in the chain, future dates, a serial open twice. Problems are listed by row and never loaded. German date formats (05.03.2026) are accepted, as SAP exports often use them.
+
+![Lane view: average days per stage on each country-to-hub lane](docs/lanes.png)
+
+<img src="docs/unit-detail.png" alt="Unit detail: each stage's days against its control limit, and the form to record the next movement" width="420" />
 
 ## Architecture
 
 ```
-client/   React + TypeScript (Vite)       aging board, queue, drawer, SLA editor
-server/   Node.js + Express + TypeScript  REST API, escalation scan, KPI queries
-          PostgreSQL                      shipments, stage history, SLA rules, escalations
+client/   React + TypeScript (Vite)       live view, lanes, control charts, escalations, import
+server/   Node.js + Express + TypeScript  REST API, control limits, escalation scan, CSV import
+          PostgreSQL                      repair orders, region contacts, escalations
 ```
 
-Design decisions worth pointing out:
+Design decisions:
 
-- **The rules engine is pure.** `server/src/domain/sla.ts` takes a shipment, a policy and a clock, and returns a level. No database, no HTTP, so it is fully unit-tested.
-- **The database enforces the workflow.** A partial unique index (`escalations_one_active`) makes it impossible for a shipment to have two active escalations, even if two scans run at once. CHECK constraints keep SLA thresholds in increasing order.
-- **Stage moves are transactional.** Closing the old stage, opening the new one, updating the shipment and resolving its escalation happen in one transaction with a row lock, so the history never contradicts the current state.
-- **Time is injectable.** The API takes a clock, which lets integration tests move forward a week and check that an acknowledged escalation re-opens when the shipment turns critical.
-- **Validation at the edge.** Request bodies are checked with Zod, and errors explain what to fix ("Thresholds must increase: warning, then escalation, then critical.").
+- **One row per repair loop, seven dates.** That is how the data comes out of an ERP, so imports need no reshaping. The current stage is derived: the first stage without an end date.
+- **The database enforces the process.** CHECK constraints keep the dates in loop order, a partial unique index allows only one open loop per serial number, and another allows only one active escalation per unit, even if two scans run at once.
+- **The statistics are pure functions.** `server/src/domain/spc.ts` (control limits and special-cause rules) and `stages.ts` have no database or HTTP, and are unit-tested against hand-calculated charts.
+- **Movements are transactional.** Recording a date and closing the escalation happen together with a row lock, so the history never contradicts the current state.
+- **The clock is injectable,** which lets the integration tests move time forward.
 
 ### API
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/shipments?level=&stage=&carrier=&q=` | Open shipments with their SLA evaluation |
-| GET | `/api/shipments/:id` | Shipment, stage history and escalations |
-| POST | `/api/shipments/:id/advance` | Move to the next stage `{ to, note? }` |
-| GET | `/api/escalations?status=active\|resolved` | Escalation queue |
-| POST | `/api/escalations/scan` | Open or raise escalations now |
+| GET | `/api/overview` | Value per stage, live country views, units beyond limit, weekly trend |
+| GET | `/api/units?stage=&country=&beyond=&q=` | Open units with their stage, days and limit |
+| GET | `/api/units/:id` | One unit: every stage against its limit, escalation history |
+| POST | `/api/units/:id/advance` | Record the end of the current stage `{ at?, note? }` |
+| GET | `/api/lanes` | Average days per stage for each country-to-hub lane |
+| GET | `/api/control-chart/:stage` | I-chart points and limits for each group |
+| GET | `/api/escalations` | Active escalations with the suggested regional owner |
+| POST | `/api/escalations/scan` | Open escalations for units beyond their limit |
 | POST | `/api/escalations/:id/acknowledge` | Take ownership `{ owner, note? }` |
 | POST | `/api/escalations/:id/resolve` | Close with a note `{ note }` |
-| GET / PUT | `/api/sla` | SLA rules and high-value threshold |
-| GET | `/api/kpis` | Dashboard figures |
+| POST | `/api/import?dryRun=true` | Check a CSV export; without `dryRun`, load the clean rows |
 
 ## Running it
 
@@ -62,12 +95,11 @@ docker compose up --build
 
 ```bash
 npm install
-createdb tower   # or point DATABASE_URL at any empty database
 DATABASE_URL=postgres://user:pass@localhost:5432/tower npm run dev -w server
 npm run dev -w client   # http://localhost:5173, proxies /api to port 4000
 ```
 
-On first start the server creates its tables and loads a synthetic demo network (260 shipments across five carriers and four repair centres). Set `SEED_DEMO=false` to start empty.
+On first start the server creates its tables and loads a synthetic network of about 1,400 repair loops over 18 months. Set `SEED_DEMO=false` to start empty and load your own export.
 
 **Tests:**
 
@@ -78,16 +110,12 @@ TEST_DATABASE_URL=postgres://.../tower_test npm test  # plus API tests against a
 
 CI runs both, with PostgreSQL as a service container, and builds the Docker image.
 
-## Data
+## Limits and next steps
 
-All data is synthetic. Carriers, references and serial numbers are invented. The tool types and price ranges are modelled on drilling-tool repair loops so the numbers feel realistic.
-
-## Next steps
-
-- Authentication and roles (logistics coordinator, team lead, manager), so escalation levels route to the right people.
-- Carrier tracking webhooks to move stages automatically instead of by hand.
-- Email or Teams notification when an escalation opens or turns critical.
-- Read shipments from SAP deliveries and repair orders instead of seeding them.
+- Stage durations are skewed (most units move quickly, a few stall for months), which widens I-chart limits. A log transform before charting would tighten them; the plain chart is kept here because it matches how the limits were read in practice.
+- Item-level history by tech ID, to see whether a tool type keeps stalling regardless of lane.
+- Carrier tracking and ERP goods-movement feeds to record dates automatically instead of by import or hand.
+- Authentication and roles, so escalations route to the right regional team.
 
 ## License
 

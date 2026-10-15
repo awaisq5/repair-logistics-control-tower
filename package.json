@@ -2,7 +2,7 @@
   "name": "repair-logistics-control-tower",
   "version": "1.0.0",
   "private": true,
-  "description": "Control tower for repair logistics: SLA rules per shipment stage, aging, escalation workflow and working capital at risk.",
+  "description": "Repair & return loop monitor: six measured stages, control limits per lane, escalation workflow, CSV import.",
   "workspaces": ["server", "client"],
   "scripts": {
     "dev": "npm run dev -w server & npm run dev -w client",

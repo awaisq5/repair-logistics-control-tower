@@ -1,19 +1,14 @@
 import type pg from 'pg'
 import { withTransaction } from './db.js'
-import type { SlaPolicy, SlaRule } from './domain/sla.js'
-import type { Stage } from './domain/stages.js'
-import { runEscalationScan, savePolicy } from './repo.js'
+import type { ImportedUnit } from './domain/importer.js'
+import { DATE_FIELDS, STAGE_INFO, type DateField, type Stage } from './domain/stages.js'
+import { insertUnits, runEscalationScan, setRegionContacts } from './repo.js'
 
-export const DEFAULT_RULES: SlaRule[] = [
-  { stage: 'awaiting_pickup', warnAfterDays: 3, escalateAfterDays: 6, criticalAfterDays: 12 },
-  { stage: 'in_transit_to_repair', warnAfterDays: 10, escalateAfterDays: 16, criticalAfterDays: 25 },
-  { stage: 'customs', warnAfterDays: 5, escalateAfterDays: 9, criticalAfterDays: 15 },
-  { stage: 'awaiting_repair', warnAfterDays: 7, escalateAfterDays: 14, criticalAfterDays: 28 },
-  { stage: 'in_repair', warnAfterDays: 21, escalateAfterDays: 35, criticalAfterDays: 50 },
-  { stage: 'return_transit', warnAfterDays: 10, escalateAfterDays: 16, criticalAfterDays: 25 },
-]
-
-export const DEFAULT_POLICY: SlaPolicy = { rules: DEFAULT_RULES, highValueEur: 100_000 }
+/**
+ * Synthetic repair & return network for the demo. Countries are real so the
+ * lanes read naturally; every location name, serial number, value and
+ * duration is generated. Nothing here comes from company data.
+ */
 
 /** Small deterministic PRNG so the demo looks the same on every machine. */
 function mulberry32(seed: number) {
@@ -26,156 +21,188 @@ function mulberry32(seed: number) {
   }
 }
 
-// Synthetic master data. Company and carrier names are invented.
-const UNITS = [
-  { material: 'TL-4410', description: 'MWD pulser assembly', value: 48_000 },
-  { material: 'TL-4425', description: 'Directional sensor module', value: 62_000 },
-  { material: 'TL-5102', description: 'Mud motor power section', value: 35_000 },
-  { material: 'TL-3307', description: 'Telemetry battery pack', value: 4_200 },
-  { material: 'TL-6001', description: 'Rotary steerable control unit', value: 184_000 },
-  { material: 'TL-4471', description: 'Gamma ray sub', value: 27_500 },
-  { material: 'TL-4490', description: 'Resistivity tool collar', value: 96_000 },
-  { material: 'TL-3315', description: 'Downhole memory module', value: 8_500 },
+// Sending country: typical days waiting to ship, chance a unit gets stuck there, preferred hubs.
+const SENDERS: Record<string, { pending: number; stuck: number; hubs: string[] }> = {
+  Algeria: { pending: 22, stuck: 0.14, hubs: ['UAE', 'Romania'] },
+  Angola: { pending: 18, stuck: 0.12, hubs: ['UAE', 'Romania'] },
+  Egypt: { pending: 12, stuck: 0.08, hubs: ['UAE', 'Germany'] },
+  Congo: { pending: 16, stuck: 0.1, hubs: ['UAE', 'Romania'] },
+  Nigeria: { pending: 20, stuck: 0.16, hubs: ['UAE', 'Romania'] },
+  Kazakhstan: { pending: 14, stuck: 0.08, hubs: ['Romania'] },
+  Colombia: { pending: 10, stuck: 0.07, hubs: ['US', 'Brazil'] },
+  Argentina: { pending: 11, stuck: 0.07, hubs: ['US', 'Brazil'] },
+  Mozambique: { pending: 13, stuck: 0.09, hubs: ['UAE'] },
+  Norway: { pending: 4, stuck: 0.03, hubs: ['Germany'] },
+  'United Kingdom': { pending: 5, stuck: 0.03, hubs: ['Germany'] },
+  Kuwait: { pending: 6, stuck: 0.04, hubs: ['UAE'] },
+  'Saudi Arabia': { pending: 7, stuck: 0.05, hubs: ['UAE'] },
+  Qatar: { pending: 6, stuck: 0.04, hubs: ['UAE'] },
+  'Trinidad and Tobago': { pending: 15, stuck: 0.1, hubs: ['US'] },
+  Guyana: { pending: 14, stuck: 0.09, hubs: ['US'] },
+  India: { pending: 9, stuck: 0.06, hubs: ['UAE'] },
+  Indonesia: { pending: 9, stuck: 0.06, hubs: ['UAE'] },
+}
+
+// Repair hub: days from goods receipt to work order, in repair, waiting to ship out.
+const HUBS: Record<string, { grToWo: number; repair: number; outbound: number }> = {
+  UAE: { grToWo: 5, repair: 21, outbound: 6 },
+  Romania: { grToWo: 8, repair: 26, outbound: 7 },
+  Germany: { grToWo: 4, repair: 18, outbound: 4 },
+  US: { grToWo: 4, repair: 20, outbound: 5 },
+  Brazil: { grToWo: 7, repair: 24, outbound: 6 },
+}
+
+// Rough transit days between regions; customs-heavy lanes take longer.
+const TRANSIT: Record<string, number> = {
+  UAE: 12,
+  Romania: 15,
+  Germany: 9,
+  US: 11,
+  Brazil: 10,
+}
+
+const MATERIALS = [
+  { material: 'Unit, hydraulic', value: 42_000 },
+  { material: 'Valve, control', value: 18_000 },
+  { material: 'Transformer, insert', value: 26_000 },
+  { material: 'Pulser assembly', value: 55_000 },
+  { material: 'Sensor module, directional', value: 68_000 },
+  { material: 'Electronics insert', value: 34_000 },
+  { material: 'Battery pack', value: 6_500 },
+  { material: 'Motor, power section', value: 39_000 },
+  { material: 'Steering unit', value: 145_000 },
 ]
-const ORIGINS = ['Aberdeen', 'Stavanger', 'Port Harcourt', 'Ahmadi', 'Perth', 'Macaé', 'Midland', 'Calgary']
-const REPAIR_CENTERS = ['Celle', 'Houston', 'Singapore', 'Dubai']
-const CARRIERS = ['Northline Freight', 'Meridian Logistics', 'Atlas Forwarding', 'Kestrel Air Cargo', 'Harbourline']
+
+const OWNERS = ['L. Haddad', 'M. Okonkwo', 'S. Ionescu', 'J. Becker', 'A. Mensah', 'R. Silva', 'K. Nurlan', 'D. Ortiz']
 
 const DAY = 86_400_000
+/** The escalation process went live this many days before "now": breaches after it get chased. */
+export const PROCESS_START_DAYS = 200
 
-export async function seedDemo(pool: pg.Pool, now: Date, count = 260): Promise<void> {
-  const existing = await pool.query(`SELECT COUNT(*)::int AS n FROM shipments`)
-  if (existing.rows[0].n > 0) return
-
-  await savePolicy(pool, DEFAULT_POLICY)
-  const rand = mulberry32(20_251_014)
+export function generateUnits(now: Date, count = 1400, seed = 20240815) {
+  const rand = mulberry32(seed)
   const pick = <T>(xs: readonly T[]) => xs[Math.floor(rand() * xs.length)]
-  const rule = new Map(DEFAULT_RULES.map((r) => [r.stage, r]))
-  // Carriers differ in reliability, so the breakdown by carrier tells a story.
-  const carrierStuckRate: Record<string, number> = {
-    'Northline Freight': 0.06,
-    'Meridian Logistics': 0.1,
-    'Atlas Forwarding': 0.22,
-    'Kestrel Air Cargo': 0.05,
-    Harbourline: 0.14,
-  }
+  const normal = () => Math.sqrt(-2 * Math.log(rand() || 1e-9)) * Math.cos(2 * Math.PI * rand())
+  const lognormal = (median: number, sigma = 0.45) => median * Math.exp(sigma * normal())
+  const processStart = now.getTime() - PROCESS_START_DAYS * DAY
 
-  await withTransaction(pool, async (client) => {
-    for (let i = 0; i < count; i++) {
-      const unit = pick(UNITS)
-      const carrier = pick(CARRIERS)
-      const origin = pick(ORIGINS)
-      const repairCenter = pick(REPAIR_CENTERS)
-      const needsCustoms = !['Celle', 'Houston'].includes(repairCenter) || rand() < 0.4
-      const delivered = rand() < 0.38
-      const targetStages: Stage[] = [
-        'awaiting_pickup',
-        'in_transit_to_repair',
-        ...(needsCustoms ? (['customs'] as Stage[]) : []),
-        'awaiting_repair',
-        'in_repair',
-        'return_transit',
-        'delivered',
-      ]
-      const finalIndex = delivered ? targetStages.length - 1 : Math.floor(rand() * (targetStages.length - 1))
+  const units: ImportedUnit[] = []
+  const chased: { serialNo: string; stage: Stage; openedAt: Date; resolvedAt: Date; days: number; limit: number; value: number }[] = []
+  const senders = Object.keys(SENDERS)
 
-      // Duration of each completed stage; occasionally a stage got stuck.
-      const durations: number[] = []
-      for (let s = 0; s < finalIndex; s++) {
-        const r = rule.get(targetStages[s])!
-        const stuck = rand() < carrierStuckRate[carrier] * 0.6
-        durations.push(stuck ? r.escalateAfterDays * (1 + rand() * 0.6) : r.warnAfterDays * (0.25 + rand() * 0.7))
-      }
-      // Time already spent in the current stage.
-      const current = targetStages[finalIndex]
-      let currentDays: number
-      if (current === 'delivered') {
-        currentDays = rand() * 85
-      } else {
-        const r = rule.get(current)!
-        const stuck = rand() < carrierStuckRate[carrier] * 1.3
-        // Skewed so most breaches are recent warnings and only a few are long overdue.
-        currentDays = stuck ? r.warnAfterDays * (1 + Math.pow(rand(), 1.7) * 3) : r.warnAfterDays * rand() * 0.95
-      }
+  for (let i = 0; i < count; i++) {
+    const sendingCountry = pick(senders)
+    const sender = SENDERS[sendingCountry]
+    const hubCountry = pick(sender.hubs)
+    const hub = HUBS[hubCountry]
+    const transit = TRANSIT[hubCountry] * (['Nigeria', 'Angola', 'Algeria', 'Congo'].includes(sendingCountry) ? 1.4 : 1)
+    const m = pick(MATERIALS)
+    const serialNo = String(10_000_000 + Math.floor(rand() * 89_999_999))
 
-      const total = durations.reduce((a, d) => a + d, 0) + currentDays
-      const createdAt = new Date(now.getTime() - total * DAY)
-      let cursor = createdAt.getTime()
-      const value = Math.round(unit.value * (0.9 + rand() * 0.2))
+    const medians: Record<Stage, number> = {
+      pending_at_sender: sender.pending,
+      transit_to_hub: transit,
+      gr_to_work_order: hub.grToWo,
+      in_repair: hub.repair,
+      awaiting_outbound: hub.outbound,
+      transit_from_hub: transit,
+    }
 
-      const stageEnteredAt = new Date(now.getTime() - currentDays * DAY)
-      const ins = await client.query<{ id: number }>(
-        `INSERT INTO shipments (reference, material, description, serial_no, value_eur, origin, repair_center, carrier,
-                                stage, stage_entered_at, created_at, delivered_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
-        [
-          `RL-${String(240_000 + i * 37).padStart(7, '0')}`,
-          unit.material,
-          unit.description,
-          `SN${Math.floor(100_000 + rand() * 899_999)}`,
-          value,
-          origin,
-          repairCenter,
-          carrier,
-          current,
-          stageEnteredAt,
-          createdAt,
-          current === 'delivered' ? stageEnteredAt : null,
-        ],
-      )
-      const id = ins.rows[0].id
+    // Loops started over the last 18 months.
+    const readyAt = new Date(now.getTime() - rand() * 540 * DAY)
+    const dates = Object.fromEntries(DATE_FIELDS.map((f) => [f, null])) as Record<DateField, Date | null>
+    dates.readyAt = readyAt
+    let cursor = readyAt.getTime()
 
-      for (let s = 0; s < finalIndex; s++) {
-        const enteredAt = new Date(cursor)
-        cursor += durations[s] * DAY
-        const leftAt = new Date(cursor)
-        await client.query(
-          `INSERT INTO stage_events (shipment_id, stage, entered_at, left_at) VALUES ($1, $2, $3, $4)`,
-          [id, targetStages[s], enteredAt, leftAt],
-        )
-        // Past breaches leave a resolved escalation behind: the history behind "capital released".
-        const r = rule.get(targetStages[s])!
-        if (durations[s] >= r.escalateAfterDays) {
-          await client.query(
-            `INSERT INTO escalations (shipment_id, level, status, stage, value_eur, owner, opened_at, acknowledged_at,
-                                      resolved_at, resolved_by_movement, note)
-             VALUES ($1, 'escalated', 'resolved', $2, $3, $4, $5, $6, $7, TRUE, $8)`,
-            [
-              id,
-              targetStages[s],
-              value,
-              pick(['J. Becker', 'A. Okafor', 'M. Lindqvist', 'S. Rahman']),
-              new Date(enteredAt.getTime() + r.escalateAfterDays * DAY),
-              new Date(enteredAt.getTime() + (r.escalateAfterDays + 0.5) * DAY),
-              leftAt,
-              `Chased ${carrier}; moved on to ${targetStages[s + 1].replaceAll('_', ' ')}.`,
-            ],
-          )
+    for (const s of STAGE_INFO) {
+      let days = lognormal(medians[s.id])
+      const stuckChance = s.id === 'pending_at_sender' || s.id === 'transit_to_hub' ? sender.stuck : 0.05
+      if (rand() < stuckChance) days *= 3 + rand() * 5
+      // After the escalation process started, most units that breach get chased and move on,
+      // some days after the breach. Not all: some stay stuck, which is what the live view shows.
+      const breachAt = medians[s.id] * 3
+      const breachTime = cursor + breachAt * DAY
+      if (days > breachAt && breachTime > processStart && rand() < 0.8) {
+        const resolvedDays = breachAt + 3 + rand() * 22
+        if (resolvedDays < days) {
+          days = resolvedDays
+          const resolvedAt = cursor + days * DAY
+          if (resolvedAt < now.getTime()) {
+            chased.push({
+              serialNo,
+              stage: s.id,
+              openedAt: new Date(breachTime),
+              resolvedAt: new Date(resolvedAt),
+              days: breachAt,
+              limit: breachAt,
+              value: Math.round(m.value * (0.85 + rand() * 0.3)),
+            })
+          }
         }
       }
-      await client.query(`INSERT INTO stage_events (shipment_id, stage, entered_at) VALUES ($1, $2, $3)`, [
-        id,
-        current,
-        stageEnteredAt,
-      ])
+      const end = cursor + days * DAY
+      if (end > now.getTime()) break
+      dates[s.end] = new Date(end)
+      cursor = end
+    }
+
+    units.push({
+      serialNo,
+      techId: `TID-${String(4400 + MATERIALS.indexOf(m) * 37).padStart(4, '0')}`,
+      material: m.material,
+      valueEur: Math.round(m.value * (0.85 + rand() * 0.3)),
+      sendingCountry,
+      sendingLocation: `${sendingCountry} operations base`,
+      hubCountry,
+      hubLocation: `${hubCountry} repair hub`,
+      returnCountry: sendingCountry,
+      dates,
+    })
+  }
+
+  // A serial can only be open once; drop later duplicates.
+  const seen = new Set<string>()
+  const unique = units.filter((u) => {
+    const key = u.serialNo + (u.dates.returnedAt ? u.dates.readyAt!.toISOString() : '')
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+  return { units: unique, chased }
+}
+
+export async function seedDemo(pool: pg.Pool, now: Date, count = 1400): Promise<void> {
+  const existing = await pool.query(`SELECT COUNT(*)::int AS n FROM repair_orders`)
+  if (existing.rows[0].n > 0) return
+
+  const { units, chased } = generateUnits(now, count)
+  await insertUnits(pool, units)
+
+  const contacts = Object.fromEntries(
+    [...Object.keys(SENDERS), ...Object.keys(HUBS)].map((c, i) => [c, OWNERS[i % OWNERS.length]]),
+  )
+  await setRegionContacts(pool, contacts)
+
+  // History of chased breaches: the escalation trail behind "capital moving again".
+  await withTransaction(pool, async (client) => {
+    for (const c of chased) {
+      await client.query(
+        `INSERT INTO escalations (repair_order_id, stage, group_key, days_at_open, limit_days, value_eur, status,
+                                  owner, opened_at, acknowledged_at, resolved_at, resolved_by_movement, note)
+         SELECT id, $2, '', $3, $4, value_eur, 'resolved', $5, $6, $6::timestamptz + INTERVAL '4 hours', $7, TRUE,
+                'Chased with the regional logistics owner; unit moved on.'
+         FROM repair_orders WHERE serial_no = $1 ORDER BY ready_at DESC LIMIT 1`,
+        [c.serialNo, c.stage, c.days, c.limit, OWNERS[c.serialNo.charCodeAt(3) % OWNERS.length], c.openedAt, c.resolvedAt],
+      )
     }
   })
 
   await runEscalationScan(pool, now)
-
-  // The scan stamps escalations with "now"; date them to when each shipment actually breached,
-  // and show a few already picked up by someone.
+  // Some current escalations already have someone on them.
   await pool.query(
-    `UPDATE escalations e
-     SET opened_at = s.stage_entered_at + make_interval(
-           secs => 86400 * CASE WHEN s.value_eur >= $1 THEN r.warn_after_days ELSE r.escalate_after_days END)
-     FROM shipments s JOIN sla_rules r ON r.stage = s.stage
-     WHERE e.shipment_id = s.id AND e.status = 'open'`,
-    [DEFAULT_POLICY.highValueEur],
-  )
-  await pool.query(
-    `UPDATE escalations SET status = 'acknowledged', owner = 'M. Lindqvist',
-            acknowledged_at = opened_at + INTERVAL '6 hours', note = 'Chasing carrier for a new ETA.'
-     WHERE status = 'open' AND id % 3 = 0`,
+    `UPDATE escalations e SET status = 'acknowledged', owner = c.owner,
+            acknowledged_at = e.opened_at, note = 'Asked the regional team for the reason and a new ship date.'
+     FROM repair_orders r JOIN region_contacts c ON c.country = r.sending_country
+     WHERE e.repair_order_id = r.id AND e.status = 'open' AND e.id % 3 = 0`,
   )
 }

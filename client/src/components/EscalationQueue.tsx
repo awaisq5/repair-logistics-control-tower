@@ -4,32 +4,30 @@ import { api, days, eur, shortDate, type Escalation, type StageMeta } from '../a
 interface Props {
   escalations: Escalation[]
   stages: StageMeta[]
-  now: Date
-  onOpen: (shipmentId: number) => void
+  onOpen: (unitId: number) => void
   onChanged: () => void
 }
 
-export function EscalationQueue({ escalations, stages, now, onOpen, onChanged }: Props) {
+export function EscalationQueue({ escalations, stages, onOpen, onChanged }: Props) {
   const [expanded, setExpanded] = useState<number | null>(null)
-  const label = (id: string) => stages.find((s) => s.id === id)?.label ?? id
+  const label = (id: string) => stages.find((s) => s.id === id)?.short ?? id
 
   if (!escalations.length) {
-    return <p className="empty">No open escalations. Every shipment is inside its escalation threshold.</p>
+    return <p className="empty">No open escalations. Every unit is inside its lane's control limit.</p>
   }
 
   return (
     <ol className="queue">
       {escalations.map((e) => {
-        const age = (now.getTime() - new Date(e.openedAt).getTime()) / 86_400_000
         const isOpen = expanded === e.id
         return (
-          <li key={e.id} className={`ticket ticket-${e.level}`}>
+          <li key={e.id} className={`ticket ${e.status === 'open' ? 'ticket-open' : 'ticket-owned'}`}>
             <button className="ticket-head" aria-expanded={isOpen} onClick={() => setExpanded(isOpen ? null : e.id)}>
-              <span className="ticket-level">{e.level === 'critical' ? 'Critical' : 'Escalated'}</span>
+              <span className="ticket-level">{label(e.stage)}</span>
               <span className="ticket-main">
-                <span className="ticket-ref">{e.reference}</span> {e.description}
+                <span className="ticket-ref">{e.serialNo}</span> {e.material}
                 <span className="ticket-sub">
-                  {label(e.stage)} with {e.carrier}, escalated {shortDate(e.openedAt)} ({days(age)} ago)
+                  {e.groupKey}: {days(e.daysAtOpen)} against a limit of {days(e.limitDays)}, escalated {shortDate(e.openedAt)}
                 </span>
               </span>
               <span className="ticket-value">{eur(e.valueEur)}</span>
@@ -45,16 +43,8 @@ export function EscalationQueue({ escalations, stages, now, onOpen, onChanged }:
   )
 }
 
-function TicketActions({
-  escalation: e,
-  onOpen,
-  onChanged,
-}: {
-  escalation: Escalation
-  onOpen: (id: number) => void
-  onChanged: () => void
-}) {
-  const [owner, setOwner] = useState('')
+function TicketActions({ escalation: e, onOpen, onChanged }: { escalation: Escalation; onOpen: (id: number) => void; onChanged: () => void }) {
+  const [owner, setOwner] = useState(e.regionOwner ?? '')
   const [note, setNote] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
@@ -74,6 +64,9 @@ function TicketActions({
 
   return (
     <div className="ticket-body">
+      {e.regionOwner && e.status === 'open' && (
+        <p className="ticket-note">Regional logistics owner for this location: {e.regionOwner}.</p>
+      )}
       {e.note && <p className="ticket-note">{e.note}</p>}
       {e.status === 'open' ? (
         <form
@@ -85,11 +78,11 @@ function TicketActions({
         >
           <label>
             Owner
-            <input value={owner} onChange={(ev) => setOwner(ev.target.value)} placeholder="Your name" required />
+            <input value={owner} onChange={(ev) => setOwner(ev.target.value)} required />
           </label>
           <label className="grow">
             First action
-            <input value={note} onChange={(ev) => setNote(ev.target.value)} placeholder="Optional, e.g. called the broker" />
+            <input value={note} onChange={(ev) => setNote(ev.target.value)} placeholder="e.g. asked the regional team for the reason" />
           </label>
           <button className="primary" disabled={busy}>
             Take ownership
@@ -105,7 +98,7 @@ function TicketActions({
         >
           <label className="grow">
             How was it resolved?
-            <input value={note} onChange={(ev) => setNote(ev.target.value)} placeholder="e.g. carrier confirmed new ETA" required />
+            <input value={note} onChange={(ev) => setNote(ev.target.value)} placeholder="e.g. shipment expedited after export licence" required />
           </label>
           <button className="primary" disabled={busy}>
             Mark resolved
@@ -113,8 +106,8 @@ function TicketActions({
         </form>
       )}
       {error && <p className="error">{error}</p>}
-      <button className="link" onClick={() => onOpen(e.shipmentId)}>
-        Open shipment {e.reference}
+      <button className="link" onClick={() => onOpen(e.repairOrderId)}>
+        Open unit {e.serialNo}
       </button>
     </div>
   )

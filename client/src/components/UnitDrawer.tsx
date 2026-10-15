@@ -1,0 +1,179 @@
+import { useEffect, useRef, useState } from 'react'
+import { STAGE_COLOURS, api, days, eur, shortDate, type StageMeta, type UnitDetail } from '../api'
+
+interface Props {
+  id: number
+  stages: StageMeta[]
+  onClose: () => void
+  onChanged: () => void
+}
+
+export function UnitDrawer({ id, stages, onClose, onChanged }: Props) {
+  const [detail, setDetail] = useState<UnitDetail | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [note, setNote] = useState('')
+  const [at, setAt] = useState('')
+  const [message, setMessage] = useState<string | null>(null)
+  const closeRef = useRef<HTMLButtonElement>(null)
+  const label = (s: string) => stages.find((x) => x.id === s)
+
+  const load = () =>
+    api
+      .unit(id)
+      .then(setDetail)
+      .catch((e: Error) => setError(e.message))
+
+  useEffect(() => {
+    setDetail(null)
+    setMessage(null)
+    setError(null)
+    load()
+    closeRef.current?.focus()
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [id])
+
+  async function advance() {
+    setError(null)
+    try {
+      const res = await api.advance(id, at ? new Date(`${at}T12:00:00`).toISOString() : undefined, note || undefined)
+      const done = label(res.completedStage)?.short.toLowerCase()
+      setMessage(
+        res.releasedEur > 0
+          ? `Recorded: ${done} is complete. The escalation is closed and ${eur(res.releasedEur)} is moving again.`
+          : `Recorded: ${done} is complete.`,
+      )
+      setNote('')
+      setAt('')
+      await load()
+      onChanged()
+    } catch (e) {
+      setError((e as Error).message)
+    }
+  }
+
+  const o = detail?.order
+  const live = detail?.live
+  const maxDays = Math.max(1, ...(detail?.stages ?? []).map((s) => Math.max(s.days ?? 0, s.ucl ?? 0)))
+  const next = live ? stages[stages.findIndex((s) => s.id === live.stage)] : null
+
+  return (
+    <div className="drawer-backdrop" onClick={onClose}>
+      <aside className="drawer" role="dialog" aria-modal="true" aria-label="Unit detail" onClick={(e) => e.stopPropagation()}>
+        <button ref={closeRef} className="drawer-close" onClick={onClose}>
+          Close
+        </button>
+        {error && <p className="error">{error}</p>}
+        {!o ? (
+          !error && <p className="empty">Loading unit…</p>
+        ) : (
+          <>
+            <p className={live?.beyondLimit ? 'pill p-beyond' : live ? 'pill p-ok' : 'pill p-done'}>
+              {live ? (live.beyondLimit ? 'Beyond its control limit' : 'Within limits') : 'Returned'}
+            </p>
+            <h2>{o.material}</h2>
+            <dl className="waybill">
+              <div>
+                <dt>Serial no.</dt>
+                <dd>{o.serialNo}</dd>
+              </div>
+              <div>
+                <dt>Tech ID</dt>
+                <dd>{o.techId}</dd>
+              </div>
+              <div>
+                <dt>Value</dt>
+                <dd>{eur(o.valueEur)}</dd>
+              </div>
+              <div>
+                <dt>From</dt>
+                <dd>{o.sendingLocation}</dd>
+              </div>
+              <div>
+                <dt>Repair hub</dt>
+                <dd>{o.hubLocation}</dd>
+              </div>
+              <div>
+                <dt>Returns to</dt>
+                <dd>{o.returnCountry}</dd>
+              </div>
+            </dl>
+
+            <h3>The loop so far</h3>
+            <p className="hint">Each bar is time spent in a stage. The tick is that stage's upper control limit for this unit's lane or hub.</p>
+            <ol className="loop-detail">
+              {detail.stages.map((s) => {
+                const meta = label(s.stage)!
+                const over = s.days !== null && s.ucl !== null && s.days > s.ucl
+                const current = live?.stage === s.stage
+                return (
+                  <li key={s.stage} className={current ? 'current' : s.done ? 'done' : 'todo'}>
+                    <span className="ld-name">
+                      {meta.short}
+                      <span className="ld-group">{s.group}</span>
+                    </span>
+                    <span className="ld-track">
+                      {s.days !== null && (
+                        <span
+                          className={over ? 'ld-fill over' : 'ld-fill'}
+                          style={{ width: `${(s.days / maxDays) * 100}%`, background: over ? undefined : STAGE_COLOURS[s.stage] }}
+                        />
+                      )}
+                      {s.ucl !== null && <span className="ld-ucl" style={{ left: `${(s.ucl / maxDays) * 100}%` }} title={`Limit ${days(s.ucl)}`} />}
+                    </span>
+                    <span className="ld-days">
+                      {s.days === null ? '' : days(s.days)}
+                      {current && ' so far'}
+                    </span>
+                  </li>
+                )
+              })}
+            </ol>
+
+            {live && next && (
+              <div className="advance">
+                <p className="advance-title">
+                  Record the end of <strong>{next.short.toLowerCase()}</strong>
+                </p>
+                <div className="advance-fields">
+                  <label>
+                    Date
+                    <input type="date" value={at} max={new Date().toISOString().slice(0, 10)} onChange={(e) => setAt(e.target.value)} />
+                  </label>
+                  <label className="grow">
+                    Note
+                    <input value={note} onChange={(e) => setNote(e.target.value)} placeholder="Optional, e.g. AWB 176-12345675" />
+                  </label>
+                </div>
+                <button className="primary" onClick={advance}>
+                  {at ? 'Record movement' : 'Record movement today'}
+                </button>
+              </div>
+            )}
+            {message && (
+              <p className="success" role="status">
+                {message}
+              </p>
+            )}
+
+            {detail.escalations.length > 0 && (
+              <>
+                <h3>Escalations</h3>
+                <ul className="esc-history">
+                  {detail.escalations.map((e) => (
+                    <li key={e.id}>
+                      {label(e.stage)?.short}, opened {shortDate(e.openedAt)},{' '}
+                      {e.status === 'resolved' ? 'resolved' : e.owner ? `owned by ${e.owner}` : 'unowned'}
+                      {e.note && <span className="tl-note">{e.note}</span>}
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </>
+        )}
+      </aside>
+    </div>
+  )
+}

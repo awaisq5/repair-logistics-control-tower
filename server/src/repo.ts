@@ -1,35 +1,58 @@
 import type pg from 'pg'
 import { withTransaction, type Db } from './db.js'
-import { evaluate, levelRank, type Evaluation, type Level, type SlaPolicy, type SlaRule } from './domain/sla.js'
-import { nextStages, type Stage } from './domain/stages.js'
+import type { ImportedUnit } from './domain/importer.js'
+import { controlLimits, limitsFor, type ControlLimits, type LimitsSet } from './domain/spc.js'
+import {
+  DATE_FIELDS,
+  STAGE_BY_ID,
+  STAGE_INFO,
+  currentStage,
+  daysBetween,
+  groupKey,
+  stageDays,
+  type DateField,
+  type Stage,
+} from './domain/stages.js'
 
-export interface Shipment {
+export interface RepairOrder {
   id: number
-  reference: string
-  material: string
-  description: string
   serialNo: string
+  techId: string
+  material: string
   valueEur: number
-  origin: string
-  repairCenter: string
-  carrier: string
+  sendingCountry: string
+  sendingLocation: string
+  hubCountry: string
+  hubLocation: string
+  returnCountry: string
+  dates: Record<DateField, Date | null>
+}
+
+/** An open unit as the dashboard sees it: where it is, for how long, and against which limit. */
+export interface LiveUnit extends RepairOrder {
   stage: Stage
-  stageEnteredAt: Date
-  createdAt: Date
-  deliveredAt: Date | null
+  group: string
+  daysInStage: number
+  limit: ControlLimits | null
+  limitScope: 'group' | 'stage' | null
+  beyondLimit: boolean
+  daysOverLimit: number
 }
 
 export interface Escalation {
   id: number
-  shipmentId: number
-  reference: string
-  description: string
-  carrier: string
-  level: 'escalated' | 'critical'
-  status: 'open' | 'acknowledged' | 'resolved'
+  repairOrderId: number
+  serialNo: string
+  techId: string
+  material: string
   stage: Stage
+  groupKey: string
+  daysAtOpen: number
+  limitDays: number
   valueEur: number
+  status: 'open' | 'acknowledged' | 'resolved'
   owner: string | null
+  regionOwner: string | null
   note: string | null
   openedAt: Date
   acknowledgedAt: Date | null
@@ -40,109 +63,182 @@ export interface Escalation {
 export class NotFoundError extends Error {}
 export class ConflictError extends Error {}
 
-const SHIPMENT_COLUMNS = `
-  id, reference, material, description, serial_no AS "serialNo", value_eur AS "valueEur",
-  origin, repair_center AS "repairCenter", carrier, stage, stage_entered_at AS "stageEnteredAt",
-  created_at AS "createdAt", delivered_at AS "deliveredAt"`
-
-const ESCALATION_COLUMNS = `
-  e.id, e.shipment_id AS "shipmentId", s.reference, s.description, s.carrier, e.level, e.status, e.stage,
-  e.value_eur AS "valueEur", e.owner, e.note, e.opened_at AS "openedAt",
-  e.acknowledged_at AS "acknowledgedAt", e.resolved_at AS "resolvedAt",
-  e.resolved_by_movement AS "resolvedByMovement"`
-
-export async function getPolicy(db: Db): Promise<SlaPolicy> {
-  const rules = await db.query<SlaRule>(`
-    SELECT stage, warn_after_days AS "warnAfterDays", escalate_after_days AS "escalateAfterDays",
-           critical_after_days AS "criticalAfterDays"
-    FROM sla_rules ORDER BY stage`)
-  const setting = await db.query<{ value: number }>(`SELECT value FROM settings WHERE key = 'high_value_eur'`)
-  return { rules: rules.rows, highValueEur: setting.rows[0]?.value ?? 100_000 }
+const DATE_SQL: Record<DateField, string> = {
+  readyAt: 'ready_at',
+  dispatchedAt: 'dispatched_at',
+  hubReceivedAt: 'hub_received_at',
+  workOrderAt: 'work_order_at',
+  repairedAt: 'repaired_at',
+  hubDispatchedAt: 'hub_dispatched_at',
+  returnedAt: 'returned_at',
 }
 
-export async function savePolicy(pool: pg.Pool, policy: SlaPolicy): Promise<void> {
-  await withTransaction(pool, async (client) => {
-    for (const r of policy.rules) {
-      await client.query(
-        `INSERT INTO sla_rules (stage, warn_after_days, escalate_after_days, critical_after_days)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (stage) DO UPDATE SET warn_after_days = $2, escalate_after_days = $3, critical_after_days = $4`,
-        [r.stage, r.warnAfterDays, r.escalateAfterDays, r.criticalAfterDays],
-      )
-    }
-    await client.query(
-      `INSERT INTO settings (key, value) VALUES ('high_value_eur', $1)
-       ON CONFLICT (key) DO UPDATE SET value = $1`,
-      [JSON.stringify(policy.highValueEur)],
-    )
-  })
+const ORDER_COLUMNS = `
+  id, serial_no, tech_id, material, value_eur, sending_country, sending_location,
+  hub_country, hub_location, return_country, ${Object.values(DATE_SQL).join(', ')}`
+
+type OrderRow = Record<string, unknown>
+
+function toOrder(r: OrderRow): RepairOrder {
+  const dates = {} as Record<DateField, Date | null>
+  for (const f of DATE_FIELDS) dates[f] = (r[DATE_SQL[f]] as Date | null) ?? null
+  return {
+    id: r.id as number,
+    serialNo: r.serial_no as string,
+    techId: r.tech_id as string,
+    material: r.material as string,
+    valueEur: r.value_eur as number,
+    sendingCountry: r.sending_country as string,
+    sendingLocation: r.sending_location as string,
+    hubCountry: r.hub_country as string,
+    hubLocation: r.hub_location as string,
+    returnCountry: r.return_country as string,
+    dates,
+  }
 }
 
-export async function listShipments(db: Db, opts: { openOnly?: boolean } = {}): Promise<Shipment[]> {
-  const where = opts.openOnly ? `WHERE stage <> 'delivered'` : ''
-  const res = await db.query<Shipment>(`SELECT ${SHIPMENT_COLUMNS} FROM shipments ${where} ORDER BY stage_entered_at`)
-  return res.rows
-}
-
-export async function getShipment(db: Db, id: number) {
-  const res = await db.query<Shipment>(`SELECT ${SHIPMENT_COLUMNS} FROM shipments WHERE id = $1`, [id])
-  const shipment = res.rows[0]
-  if (!shipment) throw new NotFoundError(`Shipment ${id} does not exist.`)
-  const events = await db.query(
-    `SELECT stage, entered_at AS "enteredAt", left_at AS "leftAt", note
-     FROM stage_events WHERE shipment_id = $1 ORDER BY entered_at`,
-    [id],
-  )
-  const escalations = await db.query<Escalation>(
-    `SELECT ${ESCALATION_COLUMNS} FROM escalations e JOIN shipments s ON s.id = e.shipment_id
-     WHERE e.shipment_id = $1 ORDER BY e.opened_at DESC`,
-    [id],
-  )
-  return { shipment, events: events.rows, escalations: escalations.rows }
+export async function listOrders(db: Db, opts: { open?: boolean } = {}): Promise<RepairOrder[]> {
+  const where = opts.open === undefined ? '' : opts.open ? 'WHERE returned_at IS NULL' : 'WHERE returned_at IS NOT NULL'
+  const res = await db.query(`SELECT ${ORDER_COLUMNS} FROM repair_orders ${where} ORDER BY ready_at`)
+  return res.rows.map(toOrder)
 }
 
 /**
- * Moves a shipment to its next stage. Closing the old stage also resolves any
- * active escalation, and records the shipment value as working capital released.
+ * Control limits for every stage and group, from completed stages that ended
+ * within the history window. Values are ordered by end date, as on an I-chart.
  */
-export async function advanceShipment(pool: pg.Pool, id: number, to: Stage, note: string | undefined, now: Date) {
-  return withTransaction(pool, async (client) => {
-    const res = await client.query<Shipment>(`SELECT ${SHIPMENT_COLUMNS} FROM shipments WHERE id = $1 FOR UPDATE`, [id])
-    const shipment = res.rows[0]
-    if (!shipment) throw new NotFoundError(`Shipment ${id} does not exist.`)
-    if (!nextStages(shipment.stage).includes(to)) {
-      throw new ConflictError(`A shipment in "${shipment.stage}" cannot move to "${to}".`)
+export async function computeLimits(db: Db, now: Date, historyDays = 365): Promise<LimitsSet> {
+  const since = new Date(now.getTime() - historyDays * 86_400_000)
+  const orders = await listOrders(db)
+  const byGroup: Record<string, Record<string, { end: number; days: number }[]>> = {}
+  const byStage: Record<string, { end: number; days: number }[]> = {}
+  for (const o of orders) {
+    const days = stageDays(o.dates)
+    for (const s of STAGE_INFO) {
+      const d = days[s.id]
+      const end = o.dates[s.end]
+      if (d === undefined || !end || end < since || end > now) continue
+      const key = groupKey(s.id, o)
+      ;((byGroup[s.id] ??= {})[key] ??= []).push({ end: end.getTime(), days: d })
+      ;(byStage[s.id] ??= []).push({ end: end.getTime(), days: d })
     }
-    await client.query(`UPDATE stage_events SET left_at = $2 WHERE shipment_id = $1 AND left_at IS NULL`, [id, now])
-    await client.query(`INSERT INTO stage_events (shipment_id, stage, entered_at, note) VALUES ($1, $2, $3, $4)`, [
-      id,
-      to,
-      now,
-      note ?? null,
-    ])
-    await client.query(
-      `UPDATE shipments SET stage = $2, stage_entered_at = $3, delivered_at = CASE WHEN $2 = 'delivered' THEN $3 ELSE delivered_at END
-       WHERE id = $1`,
-      [id, to, now],
-    )
+  }
+  const limits = (points: { end: number; days: number }[]) =>
+    controlLimits(points.sort((a, b) => a.end - b.end).map((p) => p.days))
+  const set: LimitsSet = { byGroup: {}, byStage: {} }
+  for (const [stage, groups] of Object.entries(byGroup)) {
+    set.byGroup[stage] = {}
+    for (const [key, pts] of Object.entries(groups)) {
+      const l = limits(pts)
+      if (l) set.byGroup[stage][key] = l
+    }
+  }
+  for (const [stage, pts] of Object.entries(byStage)) {
+    const l = limits(pts)
+    if (l) set.byStage[stage] = l
+  }
+  return set
+}
+
+export function toLive(order: RepairOrder, limits: LimitsSet, now: Date): LiveUnit | null {
+  const stage = currentStage(order.dates)
+  if (!stage) return null
+  const start = order.dates[STAGE_BY_ID[stage].start]
+  if (!start) return null
+  const group = groupKey(stage, order)
+  const found = limitsFor(limits, stage, group)
+  const daysInStage = Math.max(0, daysBetween(start, now))
+  const ucl = found?.limits.ucl ?? Infinity
+  return {
+    ...order,
+    stage,
+    group,
+    daysInStage,
+    limit: found?.limits ?? null,
+    limitScope: found?.scope ?? null,
+    beyondLimit: daysInStage > ucl,
+    daysOverLimit: Math.max(0, daysInStage - ucl),
+  }
+}
+
+export async function liveUnits(db: Db, now: Date, limits?: LimitsSet): Promise<LiveUnit[]> {
+  const set = limits ?? (await computeLimits(db, now))
+  return (await listOrders(db, { open: true }))
+    .map((o) => toLive(o, set, now))
+    .filter((u): u is LiveUnit => u !== null)
+}
+
+export async function getOrder(db: Db, id: number, now: Date) {
+  const res = await db.query(`SELECT ${ORDER_COLUMNS} FROM repair_orders WHERE id = $1`, [id])
+  if (!res.rowCount) throw new NotFoundError(`Repair order ${id} does not exist.`)
+  const order = toOrder(res.rows[0])
+  const limits = await computeLimits(db, now)
+  const days = stageDays(order.dates, now)
+  const stages = STAGE_INFO.map((s) => {
+    const group = groupKey(s.id, order)
+    const found = limitsFor(limits, s.id, group)
+    return {
+      stage: s.id,
+      group,
+      days: days[s.id] ?? null,
+      done: Boolean(order.dates[s.end]),
+      ucl: found?.limits.ucl ?? null,
+      mean: found?.limits.mean ?? null,
+    }
+  })
+  const escalations = await db.query(
+    `SELECT ${ESC_COLUMNS} FROM escalations e JOIN repair_orders r ON r.id = e.repair_order_id
+     ${REGION_JOIN}
+     WHERE e.repair_order_id = $1 ORDER BY e.opened_at DESC`,
+    [id],
+  )
+  return { order, live: toLive(order, limits, now), stages, escalations: escalations.rows }
+}
+
+/**
+ * Records the next movement date. Closing a stage resolves the unit's active
+ * escalation and counts its value as working capital moving again.
+ */
+export async function advanceOrder(pool: pg.Pool, id: number, at: Date, note: string | undefined) {
+  return withTransaction(pool, async (client) => {
+    const res = await client.query(`SELECT ${ORDER_COLUMNS} FROM repair_orders WHERE id = $1 FOR UPDATE`, [id])
+    if (!res.rowCount) throw new NotFoundError(`Repair order ${id} does not exist.`)
+    const order = toOrder(res.rows[0])
+    const stage = currentStage(order.dates)
+    if (!stage) throw new ConflictError(`Unit ${order.serialNo} is already back at its destination.`)
+    const info = STAGE_BY_ID[stage]
+    const start = order.dates[info.start]
+    if (start && at < start) throw new ConflictError(`The date cannot be before the stage started.`)
+    await client.query(`UPDATE repair_orders SET ${DATE_SQL[info.end]} = $2 WHERE id = $1`, [id, at])
     const resolved = await client.query(
       `UPDATE escalations SET status = 'resolved', resolved_at = $2, resolved_by_movement = TRUE,
               note = COALESCE(note || E'\\n', '') || $3
-       WHERE shipment_id = $1 AND status <> 'resolved' RETURNING value_eur`,
-      [id, now, `Resolved automatically: moved to ${to}.`],
+       WHERE repair_order_id = $1 AND status <> 'resolved' RETURNING value_eur`,
+      [id, at, note ? `Moved on: ${note}` : `Moved on to the next stage.`],
     )
-    return { releasedEur: resolved.rows[0]?.value_eur ?? 0 }
+    return { completedStage: stage, releasedEur: (resolved.rows[0]?.value_eur as number) ?? 0 }
   })
 }
 
+/** The regional logistics owner responsible for where the unit is stuck. */
+const REGION_JOIN = `LEFT JOIN region_contacts c ON c.country = CASE
+       WHEN e.stage IN ('pending_at_sender', 'transit_to_hub') THEN r.sending_country
+       WHEN e.stage = 'transit_from_hub' THEN r.return_country
+       ELSE r.hub_country END`
+
+const ESC_COLUMNS = `
+  e.id, e.repair_order_id AS "repairOrderId", r.serial_no AS "serialNo", r.tech_id AS "techId",
+  r.material, e.stage, e.group_key AS "groupKey", e.days_at_open AS "daysAtOpen", e.limit_days AS "limitDays",
+  e.value_eur AS "valueEur", e.status, e.owner, c.owner AS "regionOwner", e.note, e.opened_at AS "openedAt",
+  e.acknowledged_at AS "acknowledgedAt", e.resolved_at AS "resolvedAt", e.resolved_by_movement AS "resolvedByMovement"`
+
 export async function listEscalations(db: Db, status: 'active' | 'resolved'): Promise<Escalation[]> {
   const where = status === 'active' ? `e.status <> 'resolved'` : `e.status = 'resolved'`
-  const order =
-    status === 'active'
-      ? `CASE e.level WHEN 'critical' THEN 0 ELSE 1 END, e.value_eur DESC`
-      : `e.resolved_at DESC LIMIT 50`
+  const order = status === 'active' ? `e.value_eur DESC` : `e.resolved_at DESC LIMIT 50`
   const res = await db.query<Escalation>(
-    `SELECT ${ESCALATION_COLUMNS} FROM escalations e JOIN shipments s ON s.id = e.shipment_id WHERE ${where} ORDER BY ${order}`,
+    `SELECT ${ESC_COLUMNS} FROM escalations e JOIN repair_orders r ON r.id = e.repair_order_id
+     ${REGION_JOIN}
+     WHERE ${where} ORDER BY ${order}`,
   )
   return res.rows
 }
@@ -154,7 +250,7 @@ export async function acknowledgeEscalation(db: Db, id: number, owner: string, n
      WHERE id = $1 AND status = 'open' RETURNING id`,
     [id, owner, now, note ?? null],
   )
-  if (!res.rowCount) await assertExists(db, id, 'open')
+  if (!res.rowCount) await assertState(db, id, 'open')
 }
 
 export async function resolveEscalation(db: Db, id: number, note: string, now: Date) {
@@ -163,50 +259,72 @@ export async function resolveEscalation(db: Db, id: number, note: string, now: D
      WHERE id = $1 AND status <> 'resolved' RETURNING id`,
     [id, now, note],
   )
-  if (!res.rowCount) await assertExists(db, id, 'active')
+  if (!res.rowCount) await assertState(db, id, 'active')
 }
 
-async function assertExists(db: Db, id: number, expected: string): Promise<never> {
+async function assertState(db: Db, id: number, expected: string): Promise<never> {
   const res = await db.query(`SELECT status FROM escalations WHERE id = $1`, [id])
   if (!res.rowCount) throw new NotFoundError(`Escalation ${id} does not exist.`)
   throw new ConflictError(`Escalation ${id} is ${res.rows[0].status}, not ${expected}.`)
 }
 
 /**
- * Opens an escalation for every shipment at "escalated" or "critical",
- * and raises the level of active escalations whose shipment got worse.
- * Safe to run repeatedly: it never creates a second active escalation.
+ * Opens one escalation for every open unit beyond its control limit.
+ * Safe to run repeatedly: the partial unique index allows only one active
+ * escalation per unit, and existing ones are left alone.
  */
 export async function runEscalationScan(pool: pg.Pool, now: Date) {
-  const policy = await getPolicy(pool)
-  const shipments = await listShipments(pool, { openOnly: true })
+  const units = (await liveUnits(pool, now)).filter((u) => u.beyondLimit && u.limit)
   let opened = 0
-  let raised = 0
   await withTransaction(pool, async (client) => {
-    const active = await client.query<{ shipment_id: number; level: Level; id: number }>(
-      `SELECT id, shipment_id, level FROM escalations WHERE status <> 'resolved'`,
-    )
-    const byShipment = new Map(active.rows.map((r) => [r.shipment_id, r]))
-    for (const s of shipments) {
-      const { level } = evaluate(s, policy, now)
-      if (levelRank(level) < levelRank('escalated')) continue
-      const existing = byShipment.get(s.id)
-      if (!existing) {
-        await client.query(
-          `INSERT INTO escalations (shipment_id, level, stage, value_eur, opened_at) VALUES ($1, $2, $3, $4, $5)`,
-          [s.id, level, s.stage, s.valueEur, now],
-        )
-        opened++
-      } else if (levelRank(level) > levelRank(existing.level)) {
-        // Getting worse re-opens an acknowledged escalation so someone looks again.
-        await client.query(`UPDATE escalations SET level = $2, status = 'open' WHERE id = $1`, [existing.id, level])
-        raised++
-      }
+    for (const u of units) {
+      const res = await client.query(
+        `INSERT INTO escalations (repair_order_id, stage, group_key, days_at_open, limit_days, value_eur, opened_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (repair_order_id) WHERE status <> 'resolved' DO NOTHING`,
+        [u.id, u.stage, u.group, u.daysInStage, u.limit!.ucl, u.valueEur, now],
+      )
+      opened += res.rowCount ?? 0
     }
   })
-  return { opened, raised }
+  return { opened, beyondLimit: units.length }
 }
 
-export function withEvaluation(shipments: Shipment[], policy: SlaPolicy, now: Date): (Shipment & Evaluation)[] {
-  return shipments.map((s) => ({ ...s, ...evaluate(s, policy, now) }))
+export async function insertUnits(pool: pg.Pool, units: ImportedUnit[]) {
+  return withTransaction(pool, async (client) => {
+    let inserted = 0
+    let skipped = 0
+    for (const u of units) {
+      const res = await client.query(
+        `INSERT INTO repair_orders (serial_no, tech_id, material, value_eur, sending_country, sending_location,
+           hub_country, hub_location, return_country, ${Object.values(DATE_SQL).join(', ')})
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+         ON CONFLICT (serial_no) WHERE returned_at IS NULL DO NOTHING`,
+        [
+          u.serialNo,
+          u.techId,
+          u.material,
+          u.valueEur,
+          u.sendingCountry,
+          u.sendingLocation,
+          u.hubCountry,
+          u.hubLocation,
+          u.returnCountry,
+          ...DATE_FIELDS.map((f) => u.dates[f]),
+        ],
+      )
+      if (res.rowCount) inserted++
+      else skipped++
+    }
+    return { inserted, skipped }
+  })
+}
+
+export async function setRegionContacts(db: Db, contacts: Record<string, string>) {
+  for (const [country, owner] of Object.entries(contacts)) {
+    await db.query(
+      `INSERT INTO region_contacts (country, owner) VALUES ($1, $2) ON CONFLICT (country) DO UPDATE SET owner = $2`,
+      [country, owner],
+    )
+  }
 }

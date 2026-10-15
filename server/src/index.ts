@@ -23,8 +23,8 @@ createApp({ pool, clientDir }).listen(PORT, () => {
 setInterval(
   () => {
     runEscalationScan(pool, new Date())
-      .then(({ opened, raised }) => {
-        if (opened || raised) console.log(`Escalation scan: ${opened} opened, ${raised} raised`)
+      .then(({ opened }) => {
+        if (opened) console.log(`Escalation scan: ${opened} opened`)
       })
       .catch((error) => console.error('Escalation scan failed', error))
   },

@@ -1,50 +1,56 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
-  LEVEL_LABEL,
+  STAGE_COLOURS,
   api,
   days,
   eur,
   eurShort,
+  type ChartGroup,
   type Escalation,
-  type Kpis,
-  type Level,
-  type Policy,
-  type Shipment,
+  type Lane,
+  type LiveUnit,
+  type Overview,
+  type Stage,
   type StageMeta,
 } from './api'
-import { AgingBoard } from './components/AgingBoard'
+import { ControlChart, CountryBars, LaneChart, LoopStrip, TrendChart } from './components/Charts'
 import { EscalationQueue } from './components/EscalationQueue'
-import { ShipmentDrawer } from './components/ShipmentDrawer'
-import { SlaEditor } from './components/SlaEditor'
+import { ImportPanel } from './components/ImportPanel'
+import { UnitDrawer } from './components/UnitDrawer'
+
+type Tab = 'live' | 'lanes' | 'spc' | 'escalations' | 'import'
 
 interface State {
   stages: StageMeta[]
-  kpis: Kpis
-  shipments: Shipment[]
+  importColumns: string[]
+  overview: Overview
+  units: LiveUnit[]
   escalations: Escalation[]
-  policy: Policy
 }
 
 export default function App() {
   const [state, setState] = useState<State | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [tab, setTab] = useState<Tab>('live')
   const [openId, setOpenId] = useState<number | null>(null)
   const [scanNote, setScanNote] = useState<string | null>(null)
-  const [filter, setFilter] = useState<{ q: string; level: Level | 'past_sla' | 'all' }>({ q: '', level: 'past_sla' })
+  const [filter, setFilter] = useState<{ stage: Stage | null; country: string | null; beyond: boolean; q: string }>({
+    stage: null,
+    country: null,
+    beyond: true,
+    q: '',
+  })
+  const [lanes, setLanes] = useState<Lane[] | null>(null)
+  const [chartStage, setChartStage] = useState<Stage>('pending_at_sender')
+  const [chart, setChart] = useState<ChartGroup[] | null>(null)
 
   const refresh = useCallback(async () => {
     try {
-      const [meta, kpis, shipments, escalations, policy] = await Promise.all([
-        api.meta(),
-        api.kpis(),
-        api.shipments(),
-        api.escalations(),
-        api.policy(),
-      ])
-      setState({ stages: meta.stages, kpis, shipments, escalations, policy })
+      const [meta, overview, units, escalations] = await Promise.all([api.meta(), api.overview(), api.units(), api.escalations()])
+      setState({ stages: meta.stages, importColumns: meta.importColumns, overview, units, escalations })
       setError(null)
     } catch (e) {
-      setError(`Could not reach the control tower API. ${(e as Error).message}`)
+      setError(`Could not reach the API. ${(e as Error).message}`)
     }
   }, [])
 
@@ -52,21 +58,26 @@ export default function App() {
     refresh()
   }, [refresh])
 
+  useEffect(() => {
+    if (tab === 'lanes' && !lanes) api.lanes().then(setLanes).catch(() => setLanes([]))
+  }, [tab, lanes])
+
+  useEffect(() => {
+    if (tab !== 'spc') return
+    setChart(null)
+    api.chart(chartStage).then(setChart).catch(() => setChart([]))
+  }, [tab, chartStage])
+
   const rows = useMemo(() => {
     if (!state) return []
     const q = filter.q.trim().toLowerCase()
-    return state.shipments
-      .filter((s) =>
-        filter.level === 'all' ? true : filter.level === 'past_sla' ? s.level !== 'on_track' : s.level === filter.level,
-      )
-      .filter(
-        (s) =>
-          !q ||
-          [s.reference, s.serialNo, s.description, s.carrier, s.origin, s.repairCenter].some((f) =>
-            f.toLowerCase().includes(q),
-          ),
-      )
-      .sort((a, b) => b.daysOverdue - a.daysOverdue)
+    return state.units.filter(
+      (u) =>
+        (!filter.stage || u.stage === filter.stage) &&
+        (!filter.country || u.sendingCountry === filter.country) &&
+        (!filter.beyond || u.beyondLimit) &&
+        (!q || [u.serialNo, u.techId, u.material, u.sendingCountry, u.hubCountry].some((f) => f.toLowerCase().includes(q))),
+    )
   }, [state, filter])
 
   if (error) {
@@ -80,20 +91,23 @@ export default function App() {
       </main>
     )
   }
-  if (!state) return <main className="page"><p className="empty">Loading shipments…</p></main>
+  if (!state)
+    return (
+      <main className="page">
+        <p className="empty">Loading the repair loop…</p>
+      </main>
+    )
 
-  const { kpis, stages, policy } = state
-  const breached = kpis.byLevel.escalated.count + kpis.byLevel.critical.count
-  const breachedValue = kpis.byLevel.escalated.valueEur + kpis.byLevel.critical.valueEur
-  const now = new Date(kpis.asOf)
-  const label = (id: string) => stages.find((s) => s.id === id)?.label ?? id
+  const { overview: o, stages } = state
+  const t = o.totals
+  const stageLabel = (s: Stage) => stages.find((x) => x.id === s)?.short ?? s
+  const trendStart = o.stagnantTrend[0]?.stagnant ?? 0
+  const trendNow = o.stagnantTrend.at(-1)?.stagnant ?? 0
 
   async function scan() {
-    const { opened, raised } = await api.scan()
+    const { opened, beyondLimit } = await api.scan()
     setScanNote(
-      opened || raised
-        ? `${opened} escalation${opened === 1 ? '' : 's'} opened, ${raised} raised.`
-        : 'Checked every open shipment. Nothing new to escalate.',
+      opened ? `${opened} new escalation${opened === 1 ? '' : 's'} opened.` : `Checked ${t.open.units} units. ${beyondLimit} beyond limit, all already escalated.`,
     )
     refresh()
   }
@@ -103,12 +117,9 @@ export default function App() {
       <header className="masthead">
         <div>
           <h1>Repair logistics control tower</h1>
-          <p className="lede">Tools on their way to repair and back, measured against the SLA for every stage.</p>
+          <p className="lede">Serialized tools in the repair &amp; return loop, from the field to the repair hub and back.</p>
         </div>
         <div className="masthead-actions">
-          <span className="as-of">
-            Updated {now.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}
-          </span>
           <button className="secondary" onClick={scan}>
             Check for new escalations
           </button>
@@ -122,177 +133,239 @@ export default function App() {
 
       <section className="verdict">
         <p className="verdict-main">
-          {breached > 0 ? (
+          <strong>{eurShort(t.inTransit.valueEur)}</strong> of tools are in transit and{' '}
+          <strong>{eurShort(t.pending.valueEur)}</strong> are waiting to ship at sending locations.{' '}
+          {t.beyondLimit.units > 0 ? (
             <>
-              <strong>{breached} repair shipments</strong> worth <strong>{eurShort(breachedValue)}</strong> are past
-              their escalation threshold.{' '}
-              {kpis.byLevel.critical.count > 0 && (
-                <>
-                  <strong className="crit">{kpis.byLevel.critical.count}</strong> of them are critical.
-                </>
-              )}
+              <strong className="crit">{t.beyondLimit.units} units</strong> worth {eurShort(t.beyondLimit.valueEur)} have been in their
+              stage longer than their lane's normal variation explains.
             </>
           ) : (
-            <>Every repair shipment is inside its escalation threshold.</>
+            <>Every unit is within its lane's control limits.</>
           )}
         </p>
         <dl className="facts">
           <div>
-            <dt>In the repair loop</dt>
-            <dd>{eurShort(kpis.open.valueEur)}</dd>
-            <dd className="sub">{kpis.open.count} units</dd>
+            <dt>In the loop</dt>
+            <dd>{eurShort(t.open.valueEur)}</dd>
+            <dd className="sub">{t.open.units} units</dd>
           </div>
           <div>
-            <dt>Moving again after escalation, last 30 days</dt>
-            <dd>{eurShort(kpis.releasedLast30DaysEur)}</dd>
+            <dt>At the repair hubs</dt>
+            <dd>{eurShort(t.atHub.valueEur)}</dd>
+            <dd className="sub">{t.atHub.units} units</dd>
           </div>
           <div>
-            <dt>Stage moves inside SLA, last 90 days</dt>
-            <dd>{kpis.slaAdherenceLast90Days === null ? 'No data' : `${Math.round(kpis.slaAdherenceLast90Days * 100)}%`}</dd>
+            <dt>Moving again after escalation, last 90 days</dt>
+            <dd>{eurShort(t.releasedLast90DaysEur)}</dd>
           </div>
           <div>
-            <dt>Average turnaround, failure to return</dt>
-            <dd>{kpis.avgTurnaroundDays === null ? 'No data' : `${Math.round(kpis.avgTurnaroundDays)} days`}</dd>
+            <dt>Units beyond their limit, 26 weeks ago vs now</dt>
+            <dd>
+              {trendStart} → {trendNow}
+            </dd>
           </div>
         </dl>
       </section>
 
-      <AgingBoard
+      <LoopStrip
         stages={stages}
-        rules={policy.rules}
-        shipments={state.shipments}
-        highValueEur={policy.highValueEur}
-        onOpen={setOpenId}
+        byStage={o.byStage}
+        onPick={(s) => {
+          setTab('live')
+          setFilter({ ...filter, stage: filter.stage === s.id ? null : s.id, beyond: false })
+        }}
       />
 
-      <div className="split">
-        <section>
-          <h2>Escalation queue</h2>
-          <p className="hint">Critical first, then by value. Moving a shipment resolves its escalation automatically.</p>
-          <EscalationQueue
-            escalations={state.escalations}
-            stages={stages}
-            now={now}
-            onOpen={setOpenId}
-            onChanged={refresh}
-          />
-        </section>
-        <section>
-          {(
-            [
-              ['Carriers', kpis.byCarrier],
-              ['Repair centres', kpis.byRepairCenter],
-            ] as const
-          ).map(([title, rows]) => (
-            <div key={title} className="breakdown">
-              <h2>{title}</h2>
-              <p className="hint">Open shipments past their warning threshold.</p>
-              <table className="carriers">
+      <nav className="tabs" role="tablist">
+        {(
+          [
+            ['live', 'Live units'],
+            ['lanes', 'Lanes'],
+            ['spc', 'Control charts'],
+            ['escalations', `Escalations (${state.escalations.length})`],
+            ['import', 'Load data'],
+          ] as [Tab, string][]
+        ).map(([id, text]) => (
+          <button key={id} role="tab" aria-selected={tab === id} className={tab === id ? 'tab active' : 'tab'} onClick={() => setTab(id)}>
+            {text}
+          </button>
+        ))}
+      </nav>
+
+      {tab === 'live' && (
+        <>
+          <div className="split">
+            <section>
+              <h2>Pending at sending location</h2>
+              <p className="hint">Average days waiting to ship, by country. Select a country to list its units.</p>
+              <CountryBars
+                rows={o.pendingByCountry}
+                unit="units"
+                selected={filter.stage === 'pending_at_sender' ? filter.country : null}
+                onSelect={(c) => setFilter({ ...filter, stage: c ? 'pending_at_sender' : null, country: c, beyond: false })}
+              />
+            </section>
+            <section>
+              <h2>In transit to repair hub</h2>
+              <p className="hint">Average days since dispatch, by sending country.</p>
+              <CountryBars
+                rows={o.inTransitByCountry}
+                unit="units"
+                selected={filter.stage === 'transit_to_hub' ? filter.country : null}
+                onSelect={(c) => setFilter({ ...filter, stage: c ? 'transit_to_hub' : null, country: c, beyond: false })}
+              />
+            </section>
+          </div>
+
+          <section className="units">
+            <div className="units-head">
+              <h2>Units</h2>
+              <div className="filters">
+                <label className="search">
+                  Search
+                  <input
+                    type="search"
+                    value={filter.q}
+                    onChange={(e) => setFilter({ ...filter, q: e.target.value })}
+                    placeholder="Serial, tech ID, material or country"
+                  />
+                </label>
+                <div className="segmented" role="group" aria-label="Which units">
+                  <button aria-pressed={filter.beyond} onClick={() => setFilter({ ...filter, beyond: true })}>
+                    Beyond limit
+                  </button>
+                  <button aria-pressed={!filter.beyond} onClick={() => setFilter({ ...filter, beyond: false })}>
+                    All open
+                  </button>
+                </div>
+              </div>
+            </div>
+            {(filter.stage || filter.country) && (
+              <p className="filter-note">
+                Showing {filter.stage ? stageLabel(filter.stage).toLowerCase() : 'all stages'}
+                {filter.country ? ` from ${filter.country}` : ''}.{' '}
+                <button className="link" onClick={() => setFilter({ ...filter, stage: null, country: null })}>
+                  Clear
+                </button>
+              </p>
+            )}
+            <div className="table-wrap">
+              <table>
                 <thead>
                   <tr>
-                    <th>{title === 'Carriers' ? 'Carrier' : 'Repair centre'}</th>
-                    <th className="n">Past SLA</th>
+                    <th>Unit</th>
+                    <th>Stage</th>
+                    <th className="n">In stage</th>
+                    <th className="n">Limit</th>
+                    <th>Route</th>
                     <th className="n">Value</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map((c) => (
-                    <tr key={c.name}>
-                      <td>{c.name}</td>
-                      <td className="n">
-                        {c.pastSla} of {c.open}
-                        <span className="bar" aria-hidden="true">
-                          <span style={{ width: `${(c.pastSla / Math.max(1, c.open)) * 100}%` }} />
+                  {rows.slice(0, 80).map((u) => (
+                    <tr key={u.id} className="clickable" onClick={() => setOpenId(u.id)}>
+                      <td>
+                        <button className="row-link" onClick={() => setOpenId(u.id)}>
+                          {u.serialNo}
+                        </button>
+                        <span className="desc">
+                          {u.material} · {u.techId}
                         </span>
                       </td>
-                      <td className="n">{eurShort(c.valuePastSla)}</td>
+                      <td>
+                        <span className="dot" style={{ background: STAGE_COLOURS[u.stage] }} aria-hidden="true" />
+                        {stageLabel(u.stage)}
+                        <span className="desc">{u.group}</span>
+                      </td>
+                      <td className={u.beyondLimit ? 'n over' : 'n'}>{days(u.daysInStage)}</td>
+                      <td className="n">{u.limit ? days(u.limit.ucl) : '–'}</td>
+                      <td>
+                        {u.sendingCountry} → {u.hubCountry}
+                      </td>
+                      <td className="n">{eur(u.valueEur)}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
+              {rows.length === 0 && <p className="empty">No units match. Switch to all open units or clear the filter.</p>}
+              {rows.length > 80 && <p className="hint">Showing the 80 longest overdue of {rows.length}.</p>}
             </div>
-          ))}
-        </section>
-      </div>
+          </section>
+        </>
+      )}
 
-      <section className="shipments">
-        <h2>Shipments</h2>
-        <div className="filters">
-          <label className="search">
-            Search
-            <input
-              type="search"
-              value={filter.q}
-              onChange={(e) => setFilter({ ...filter, q: e.target.value })}
-              placeholder="Reference, serial, tool, carrier or location"
-            />
-          </label>
-          <div className="segmented" role="group" aria-label="Filter by SLA level">
-            {(['past_sla', 'critical', 'escalated', 'warning', 'all'] as const).map((l) => (
-              <button
-                key={l}
-                aria-pressed={filter.level === l}
-                onClick={() => setFilter({ ...filter, level: l })}
-              >
-                {l === 'past_sla' ? 'Past SLA' : l === 'all' ? 'All open' : LEVEL_LABEL[l]}
+      {tab === 'lanes' && (
+        <section>
+          <h2>Where the time goes on each lane</h2>
+          <p className="hint">
+            Average days per stage over the last 12 months, sending country to repair hub, longest lanes first. Lanes with fewer
+            than three units are left out.
+          </p>
+          {lanes ? <LaneChart lanes={lanes} stages={stages} /> : <p className="empty">Loading lanes…</p>}
+        </section>
+      )}
+
+      {tab === 'spc' && (
+        <section>
+          <h2>Control charts</h2>
+          <p className="hint">
+            Days per completed unit, in completion order, grouped by{' '}
+            {
+              {
+                sendingCountry: 'sending country',
+                inboundLane: 'lane',
+                hub: 'repair hub',
+                outboundLane: 'return lane',
+              }[stages.find((s) => s.id === chartStage)!.groupBy]
+            }
+            . Each group has its own limits, so a slow lane is judged against itself, not against the network average.
+          </p>
+          <div className="segmented stage-pick" role="group" aria-label="Stage">
+            {stages.map((s) => (
+              <button key={s.id} aria-pressed={chartStage === s.id} onClick={() => setChartStage(s.id)}>
+                {s.short}
               </button>
             ))}
           </div>
-        </div>
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Shipment</th>
-                <th>Stage</th>
-                <th className="n">In stage</th>
-                <th>Route</th>
-                <th>Carrier</th>
-                <th className="n">Value</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.slice(0, 60).map((s) => (
-                <tr key={s.id} className="clickable" onClick={() => setOpenId(s.id)}>
-                  <td>
-                    <button className="row-link" onClick={() => setOpenId(s.id)}>
-                      {s.reference}
-                    </button>
-                    <span className="desc">{s.description}</span>
-                  </td>
-                  <td>
-                    <span className={`dot d-${s.level}`} aria-hidden="true" />
-                    {label(s.stage)}
-                    <span className="desc">{LEVEL_LABEL[s.level]}</span>
-                  </td>
-                  <td className="n">{days(s.daysInStage)}</td>
-                  <td>
-                    {s.origin} to {s.repairCenter}
-                  </td>
-                  <td>{s.carrier}</td>
-                  <td className="n">{eur(s.valueEur)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {rows.length === 0 && <p className="empty">No shipments match. Clear the search or pick another level.</p>}
-          {rows.length > 60 && <p className="hint">Showing the 60 most overdue of {rows.length}. Search to narrow down.</p>}
-        </div>
-      </section>
+          {chart ? <ControlChart groups={chart.slice(0, 8)} onOpen={setOpenId} /> : <p className="empty">Loading chart…</p>}
+          <div className="split trend-split">
+            <div>
+              <h3>Units beyond their limit, week by week</h3>
+              <TrendChart trend={o.stagnantTrend} />
+            </div>
+            <div className="method">
+              <h3>How the limits work</h3>
+              <p>
+                For each stage and group, the limit is the average plus 2.66 times the average moving range of the last 12 months of
+                completed units: the standard individuals (I-MR) chart. A unit above it has been in its stage longer than that
+                lane's normal variation explains, which makes it worth a call.
+              </p>
+              <p>Groups with fewer than 8 completed units use the limits of the whole stage instead.</p>
+            </div>
+          </div>
+        </section>
+      )}
 
-      <details className="sla">
-        <summary>SLA rules per stage</summary>
-        <SlaEditor policy={policy} stages={stages} onSaved={refresh} />
-      </details>
+      {tab === 'escalations' && (
+        <section>
+          <h2>Escalation queue</h2>
+          <p className="hint">
+            One escalation per unit beyond its limit, largest value first, suggested to the regional logistics owner. Recording the next
+            movement closes it.
+          </p>
+          <EscalationQueue escalations={state.escalations} stages={stages} onOpen={setOpenId} onChanged={refresh} />
+        </section>
+      )}
+
+      {tab === 'import' && <ImportPanel columns={state.importColumns} onLoaded={refresh} />}
 
       <footer className="footer">
-        Demo data is synthetic. API: Node.js, Express and PostgreSQL.{' '}
+        Demo data is synthetic: countries are real, every location, serial number, value and duration is generated.{' '}
         <a href="https://github.com/awaisq5/repair-logistics-control-tower">Source on GitHub</a>
       </footer>
 
-      {openId !== null && (
-        <ShipmentDrawer id={openId} stages={stages} onClose={() => setOpenId(null)} onChanged={refresh} />
-      )}
+      {openId !== null && <UnitDrawer id={openId} stages={stages} onClose={() => setOpenId(null)} onChanged={refresh} />}
     </div>
   )
 }

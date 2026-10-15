@@ -3,23 +3,21 @@ import { existsSync } from 'node:fs'
 import path from 'node:path'
 import type pg from 'pg'
 import { z } from 'zod'
-import { computeKpis } from './kpis.js'
+import { controlChart, laneBreakdown, overview } from './analytics.js'
+import { DATE_COLUMNS, REQUIRED_COLUMNS, importCsv } from './domain/importer.js'
+import { DATE_FIELDS, STAGES, STAGE_INFO } from './domain/stages.js'
 import {
   ConflictError,
   NotFoundError,
   acknowledgeEscalation,
-  advanceShipment,
-  getPolicy,
-  getShipment,
+  advanceOrder,
+  getOrder,
+  insertUnits,
   listEscalations,
-  listShipments,
+  liveUnits,
   resolveEscalation,
   runEscalationScan,
-  savePolicy,
-  withEvaluation,
 } from './repo.js'
-import { LEVELS, validateRule } from './domain/sla.js'
-import { OPEN_STAGES, STAGES, STAGE_LABELS, nextStages } from './domain/stages.js'
 
 export interface AppOptions {
   pool: pg.Pool
@@ -30,34 +28,18 @@ export interface AppOptions {
 
 class BadRequestError extends Error {}
 
-const stageSchema = z.enum(STAGES)
 const idSchema = z.coerce.number().int().positive()
-
-const advanceBody = z.object({ to: stageSchema, note: z.string().trim().max(500).optional() })
+const stageSchema = z.enum(STAGES)
+const advanceBody = z.object({ at: z.coerce.date().optional(), note: z.string().trim().max(500).optional() })
 const acknowledgeBody = z.object({
   owner: z.string().trim().min(1, 'Name who owns the follow-up.').max(80),
   note: z.string().trim().max(500).optional(),
 })
 const resolveBody = z.object({ note: z.string().trim().min(1, 'Say how it was resolved.').max(500) })
-const policyBody = z.object({
-  highValueEur: z.number().positive(),
-  rules: z
-    .array(
-      z.object({
-        stage: z.enum(OPEN_STAGES as [string, ...string[]]),
-        warnAfterDays: z.number(),
-        escalateAfterDays: z.number(),
-        criticalAfterDays: z.number(),
-      }),
-    )
-    .min(1),
-})
 
 function parse<T>(schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value)
-  if (!result.success) {
-    throw new BadRequestError(result.error.issues.map((i) => i.message).join(' '))
-  }
+  if (!result.success) throw new BadRequestError(result.error.issues.map((i) => i.message).join(' '))
   return result.data
 }
 
@@ -74,65 +56,52 @@ export function createApp({ pool, now = () => new Date(), clientDir }: AppOption
 
   api.get('/meta', (_req, res) => {
     res.json({
-      stages: STAGES.map((s) => ({ id: s, label: STAGE_LABELS[s], next: nextStages(s) })),
-      levels: LEVELS,
+      stages: STAGE_INFO.map((s) => ({ id: s.id, label: s.label, short: s.short, groupBy: s.groupBy })),
+      importColumns: [...REQUIRED_COLUMNS, ...DATE_FIELDS.map((f) => DATE_COLUMNS[f]).filter((c) => c !== 'ready_at')],
     })
   })
 
-  api.get('/shipments', async (req, res) => {
-    const policy = await getPolicy(pool)
-    const openOnly = req.query.open !== 'false'
-    let rows = withEvaluation(await listShipments(pool, { openOnly }), policy, now())
-    const { level, stage, carrier, q } = req.query
-    if (typeof level === 'string') rows = rows.filter((s) => s.level === level)
-    if (typeof stage === 'string') rows = rows.filter((s) => s.stage === stage)
-    if (typeof carrier === 'string') rows = rows.filter((s) => s.carrier === carrier)
+  api.get('/overview', async (_req, res) => {
+    res.json(await overview(pool, now()))
+  })
+
+  api.get('/units', async (req, res) => {
+    let units = await liveUnits(pool, now())
+    const { stage, country, beyond, q } = req.query
+    if (typeof stage === 'string') units = units.filter((u) => u.stage === stage)
+    if (typeof country === 'string') units = units.filter((u) => u.sendingCountry === country)
+    if (beyond === 'true') units = units.filter((u) => u.beyondLimit)
     if (typeof q === 'string' && q.trim()) {
       const needle = q.trim().toLowerCase()
-      rows = rows.filter((s) =>
-        [s.reference, s.serialNo, s.description, s.origin, s.repairCenter].some((f) => f.toLowerCase().includes(needle)),
+      units = units.filter((u) =>
+        [u.serialNo, u.techId, u.material, u.sendingCountry, u.hubCountry].some((f) => f.toLowerCase().includes(needle)),
       )
     }
-    res.json(rows)
+    res.json(units.sort((a, b) => b.daysOverLimit - a.daysOverLimit || b.daysInStage - a.daysInStage))
   })
 
-  api.get('/shipments/:id', async (req, res) => {
+  api.get('/units/:id', async (req, res) => {
+    res.json(await getOrder(pool, parse(idSchema, req.params.id), now()))
+  })
+
+  api.post('/units/:id/advance', async (req, res) => {
     const id = parse(idSchema, req.params.id)
-    const policy = await getPolicy(pool)
-    const detail = await getShipment(pool, id)
-    const [shipment] = withEvaluation([detail.shipment], policy, now())
-    res.json({ ...detail, shipment })
+    const body = parse(advanceBody, req.body ?? {})
+    const at = body.at ?? now()
+    if (at > now()) throw new BadRequestError('The movement date cannot be in the future.')
+    res.json(await advanceOrder(pool, id, at, body.note))
   })
 
-  api.post('/shipments/:id/advance', async (req, res) => {
-    const id = parse(idSchema, req.params.id)
-    const body = parse(advanceBody, req.body)
-    const result = await advanceShipment(pool, id, body.to, body.note, now())
-    res.json(result)
+  api.get('/lanes', async (_req, res) => {
+    res.json(await laneBreakdown(pool, now()))
   })
 
-  api.get('/kpis', async (_req, res) => {
-    res.json(await computeKpis(pool, await getPolicy(pool), now()))
-  })
-
-  api.get('/sla', async (_req, res) => {
-    res.json(await getPolicy(pool))
-  })
-
-  api.put('/sla', async (req, res) => {
-    const body = parse(policyBody, req.body)
-    const rules = body.rules.map((r) => ({ ...r, stage: parse(stageSchema, r.stage) }))
-    for (const rule of rules) {
-      const problem = validateRule(rule)
-      if (problem) throw new BadRequestError(`${STAGE_LABELS[rule.stage]}: ${problem}`)
-    }
-    await savePolicy(pool, { rules, highValueEur: body.highValueEur })
-    res.json(await getPolicy(pool))
+  api.get('/control-chart/:stage', async (req, res) => {
+    res.json(await controlChart(pool, parse(stageSchema, req.params.stage), now()))
   })
 
   api.get('/escalations', async (req, res) => {
-    const status = req.query.status === 'resolved' ? 'resolved' : 'active'
-    res.json(await listEscalations(pool, status))
+    res.json(await listEscalations(pool, req.query.status === 'resolved' ? 'resolved' : 'active'))
   })
 
   api.post('/escalations/scan', async (_req, res) => {
@@ -140,17 +109,24 @@ export function createApp({ pool, now = () => new Date(), clientDir }: AppOption
   })
 
   api.post('/escalations/:id/acknowledge', async (req, res) => {
-    const id = parse(idSchema, req.params.id)
     const body = parse(acknowledgeBody, req.body)
-    await acknowledgeEscalation(pool, id, body.owner, body.note, now())
+    await acknowledgeEscalation(pool, parse(idSchema, req.params.id), body.owner, body.note, now())
     res.json({ ok: true })
   })
 
   api.post('/escalations/:id/resolve', async (req, res) => {
-    const id = parse(idSchema, req.params.id)
     const body = parse(resolveBody, req.body)
-    await resolveEscalation(pool, id, body.note, now())
+    await resolveEscalation(pool, parse(idSchema, req.params.id), body.note, now())
     res.json({ ok: true })
+  })
+
+  /** Load an R&R movement export. Rows with problems are reported, never loaded. */
+  api.post('/import', express.text({ type: ['text/csv', 'text/plain'], limit: '5mb' }), async (req, res) => {
+    if (typeof req.body !== 'string' || !req.body.trim()) throw new BadRequestError('Send the CSV file as the request body.')
+    const result = importCsv(req.body, now())
+    const dryRun = req.query.dryRun === 'true'
+    const loaded = dryRun ? { inserted: 0, skipped: 0 } : await insertUnits(pool, result.units)
+    res.json({ rowsRead: result.rowsRead, valid: result.units.length, issues: result.issues, ...loaded, dryRun })
   })
 
   api.use((_req, res) => {
