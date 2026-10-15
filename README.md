@@ -8,9 +8,11 @@ This app tracks every unit through the loop's six stages, learns from history ho
 
 ## Where this comes from
 
-In my third rotation in a supply chain leadership programme I worked on global repair logistics optimisation. I validated several candidate datasets, built a Power BI dashboard on the real-time and historic R&R shipments, automated the data refresh and the estimation of days per logistics stage, and defined service levels to catch critical delays. A control chart of shipment days by country showed which locations were consistently out of line, and talking to the regional logistics teams turned those signals into actions (on one lane, a stalled shipment was expedited after a discussion with the local team). The dashboard tracked more than $5.8M of high-value items in transit and about $6M pending at sending locations.
+In a supply chain leadership programme I worked on global repair logistics optimisation: I built a Power BI dashboard to monitor repair shipments stage by stage, set service-level thresholds for each logistics stage, used control charts to spot locations that were consistently out of line, and introduced escalation workflows with the regional logistics teams. As stated on my CV, the dashboard covered 10K+ shipments a year and $12M+ of shipment value, stagnant shipments fell by 18% and $1.5M of working capital was released.
 
 This project rebuilds that method as an application: the same six stages, the same lane and country views, and the control-chart logic built in, so the escalation workflow runs on top of it instead of beside it. **All data in this repository is synthetic.** Countries are real so the lanes read naturally; every location, serial number, value and duration is generated.
+
+> **Independent personal project.** I built this on my own time, after my employment ended, to show the kind of work I did professionally. It contains no code, data, documents, screenshots or other information belonging to any former employer, its customers or its suppliers. The method is rebuilt from general professional knowledge, all data in the repository is synthetic, and the only figures quoted from my career are the ones published on my CV.
 
 ## The six stages
 

@@ -361,7 +361,7 @@ export default function App() {
       {tab === 'import' && <ImportPanel columns={state.importColumns} onLoaded={refresh} />}
 
       <footer className="footer">
-        Demo data is synthetic: countries are real, every location, serial number, value and duration is generated.{' '}
+        Demo data is synthetic: countries are real, every location, serial number, value and duration is generated. Independent personal project; it contains no information from any former employer.{' '}
         <a href="https://github.com/awaisq5/repair-logistics-control-tower">Source on GitHub</a>
       </footer>
 
