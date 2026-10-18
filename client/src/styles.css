@@ -444,7 +444,8 @@ tr.clickable:hover td {
 /* Buttons ----------------------------------------------------------------- */
 
 button.primary,
-button.secondary {
+button.secondary,
+a.button {
   font: inherit;
   font-weight: 600;
   padding: 7px 14px;
@@ -462,10 +463,20 @@ button.primary:disabled {
   opacity: 0.6;
 }
 
-button.secondary {
+button.secondary,
+a.button.secondary {
   background: var(--card);
   color: var(--ink);
   border: 1px solid var(--ink);
+  text-decoration: none;
+}
+
+.section-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  align-items: center;
+  justify-content: space-between;
 }
 
 button.link {
@@ -480,6 +491,7 @@ button.link {
 }
 
 button:focus-visible,
+a.button:focus-visible,
 input:focus-visible,
 summary:focus-visible {
   outline: 2px solid var(--action);

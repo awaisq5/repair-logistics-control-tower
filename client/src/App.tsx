@@ -349,10 +349,17 @@ export default function App() {
 
       {tab === 'escalations' && (
         <section>
-          <h2>Escalation queue</h2>
+          <div className="section-head">
+            <h2>Escalation queue</h2>
+            {state.escalations.length > 0 && (
+              <a className="button secondary" href="/api/escalations.csv" download>
+                Download CSV for the weekly call
+              </a>
+            )}
+          </div>
           <p className="hint">
             One escalation per unit beyond its limit, largest value first, suggested to the regional logistics owner. Recording the next
-            movement closes it.
+            movement closes it. The download shows how long each unit has been in its stage as of today.
           </p>
           <EscalationQueue escalations={state.escalations} stages={stages} onOpen={setOpenId} onChanged={refresh} />
         </section>
