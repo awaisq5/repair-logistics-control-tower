@@ -108,6 +108,16 @@ export interface UnitDetail {
   live: LiveUnit | null
   stages: { stage: Stage; group: string; days: number | null; done: boolean; ucl: number | null; mean: number | null }[]
   escalations: Escalation[]
+  history: {
+    serial: { id: number; startedAt: string | null; returnedAt: string | null; totalDays: number | null; longestStage: Stage | null; longestDays: number | null }[]
+    tech: {
+      techId: string
+      loops: number
+      techAvgTotalDays: number | null
+      othersAvgTotalDays: number | null
+      stages: { stage: Stage; techAvgDays: number | null; othersAvgDays: number | null; ratio: number | null; stalls: boolean }[]
+    }
+  }
 }
 
 export interface ImportReport {

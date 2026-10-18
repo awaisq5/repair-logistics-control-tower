@@ -157,6 +157,8 @@ export function UnitDrawer({ id, stages, onClose, onChanged }: Props) {
               </p>
             )}
 
+            <TechHistory detail={detail} label={(id) => label(id)?.short ?? id} />
+
             {detail.escalations.length > 0 && (
               <>
                 <h3>Escalations</h3>
@@ -175,5 +177,72 @@ export function UnitDrawer({ id, stages, onClose, onChanged }: Props) {
         )}
       </aside>
     </div>
+  )
+}
+
+function TechHistory({ detail, label }: { detail: UnitDetail; label: (stage: string) => string }) {
+  const { tech, serial } = detail.history
+  const stalls = tech.stages.filter((s) => s.stalls)
+  const ratio = (r: number | null) => (r === null ? '' : `${r.toFixed(1)}×`)
+  return (
+    <>
+      <h3>History of {tech.techId}</h3>
+      {tech.loops === 0 ? (
+        <p className="hint">No completed loops of this tool type yet.</p>
+      ) : (
+        <>
+          <p className="hint">
+            {tech.loops} completed {tech.loops === 1 ? 'loop' : 'loops'} of this tool type, on every lane, against all other tool types.
+            {tech.techAvgTotalDays !== null && tech.othersAvgTotalDays !== null && (
+              <> A loop takes {days(tech.techAvgTotalDays)} on average, against {days(tech.othersAvgTotalDays)}.</>
+            )}
+          </p>
+          {stalls.length > 0 && (
+            <p className="stall-note">
+              Keeps stalling at {stalls.map((s) => `“${label(s.stage)}”`).join(' and ')}, whatever the lane. That points at the tool type, not
+              at one lane or region.
+            </p>
+          )}
+          <table className="history-table">
+            <thead>
+              <tr>
+                <th>Stage</th>
+                <th className="num">This tool type</th>
+                <th className="num">Others</th>
+                <th className="num">Ratio</th>
+              </tr>
+            </thead>
+            <tbody>
+              {tech.stages.map((s) => (
+                <tr key={s.stage} className={s.stalls ? 'stalls' : undefined}>
+                  <td>{label(s.stage)}</td>
+                  <td className="num">{s.techAvgDays === null ? '' : days(s.techAvgDays)}</td>
+                  <td className="num">{s.othersAvgDays === null ? '' : days(s.othersAvgDays)}</td>
+                  <td className="num">{ratio(s.ratio)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+
+      <h3>Earlier loops of this serial number</h3>
+      {serial.length === 0 ? (
+        <p className="hint">This is the first loop recorded for {detail.order.serialNo}.</p>
+      ) : (
+        <ul className="esc-history">
+          {serial.map((l) => (
+            <li key={l.id}>
+              {l.startedAt ? shortDate(l.startedAt) : '?'} to {l.returnedAt ? shortDate(l.returnedAt) : '?'}: {l.totalDays === null ? '' : days(l.totalDays)}
+              {l.longestStage && l.longestDays !== null && (
+                <span className="tl-note">
+                  Longest stage: {label(l.longestStage)}, {days(l.longestDays)}
+                </span>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </>
   )
 }

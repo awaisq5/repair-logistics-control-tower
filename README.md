@@ -46,6 +46,7 @@ A unit above its UCL has been in its stage longer than that lane's normal variat
 - **Lanes.** Average days per stage for every country-to-hub lane, stacked, so you can see whether a lane is slow because of the sending country, the road, or the hub.
 - **Control charts.** The I-chart per stage, grouped by country, lane or hub, with special causes highlighted and a week-by-week count of units beyond their limit.
 - **Escalations.** A scan, run every 15 minutes and on demand, opens one escalation per unit beyond its limit and suggests the regional logistics owner for that location. Recording the unit's next movement closes the escalation and counts its value as working capital moving again. The queue downloads as CSV for the weekly call with the regional teams.
+- **Tool type history.** The unit detail compares the tech ID's completed loops with all other tool types, stage by stage, across every lane. A stage where it takes 1.5× as long or more, over at least five loops, is flagged: the tool type keeps stalling there, whatever the lane. Earlier loops of the same serial number are listed too. In the demo, steering units take longer in repair at every hub.
 - **Load data.** Upload a movement export with seven dates per unit. Every row is checked first: dates out of order, gaps in the chain, future dates, a serial open twice. Problems are listed by row and never loaded. German date formats (05.03.2026) are accepted, as SAP exports often use them.
 
 ![Lane view: average days per stage on each country-to-hub lane](docs/lanes.png)
@@ -74,7 +75,7 @@ Design decisions:
 |---|---|---|
 | GET | `/api/overview` | Value per stage, live country views, units beyond limit, weekly trend |
 | GET | `/api/units?stage=&country=&beyond=&q=` | Open units with their stage, days and limit |
-| GET | `/api/units/:id` | One unit: every stage against its limit, escalation history |
+| GET | `/api/units/:id` | One unit: every stage against its limit, escalation history, tool type and serial history |
 | POST | `/api/units/:id/advance` | Record the end of the current stage `{ at?, note? }` |
 | GET | `/api/lanes` | Average days per stage for each country-to-hub lane |
 | GET | `/api/control-chart/:stage` | I-chart points and limits for each group |
@@ -116,7 +117,6 @@ CI runs both, with PostgreSQL as a service container, and builds the Docker imag
 ## Limits and next steps
 
 - Stage durations are skewed (most units move quickly, a few stall for months), which widens I-chart limits. A log transform before charting would tighten them; the plain chart is kept here because it matches how the limits were read in practice.
-- Item-level history by tech ID, to see whether a tool type keeps stalling regardless of lane.
 - Carrier tracking and ERP goods-movement feeds to record dates automatically instead of by import or hand.
 - Authentication and roles, so escalations route to the right regional team.
 

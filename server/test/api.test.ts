@@ -136,6 +136,17 @@ describe.skipIf(!url)('API', () => {
     await request(app()).post('/api/escalations/99/resolve').send({ note: 'done' }).expect(404)
   })
 
+  it('shows the tool type history and earlier loops of the serial in the unit detail', async () => {
+    // H0..H9 are returned loops of TID-1; H3 comes back for a second loop.
+    await load([...history([10, 12, 9, 11, 10, 13, 9, 12, 11, 10]), `H3,TID-1,Valve,1000,Egypt,Base,UAE,Hub,Egypt,${iso(5)},,,,,,`])
+    const [unit] = (await request(app()).get('/api/units?q=H3').expect(200)).body
+    const { history: h } = (await request(app()).get(`/api/units/${unit.id}`).expect(200)).body
+    expect(h.serial).toHaveLength(1)
+    expect(h.serial[0]).toMatchObject({ totalDays: 41, longestStage: 'in_repair' })
+    expect(h.tech).toMatchObject({ techId: 'TID-1', loops: 10, othersAvgTotalDays: null })
+    expect(h.tech.stages.every((s: { stalls: boolean }) => !s.stalls)).toBe(true)
+  })
+
   it('seeds a demo with live breaches, history and released capital', async () => {
     await seedDemo(pool, clock, 600)
     const o = (await request(app()).get('/api/overview')).body
