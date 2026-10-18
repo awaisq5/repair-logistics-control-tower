@@ -1,5 +1,6 @@
 import type pg from 'pg'
 import { withTransaction, type Db } from './db.js'
+import { pastLoops, techHistory } from './domain/history.js'
 import type { ImportedUnit } from './domain/importer.js'
 import { controlLimits, limitsFor, type ControlLimits, type LimitsSet } from './domain/spc.js'
 import {
@@ -192,7 +193,9 @@ export async function getOrder(db: Db, id: number, now: Date) {
      WHERE e.repair_order_id = $1 ORDER BY e.opened_at DESC`,
     [id],
   )
-  return { order, live: toLive(order, limits, now), stages, escalations: escalations.rows }
+  const done = await listOrders(db, { open: false })
+  const history = { serial: pastLoops(order.serialNo, order.id, done), tech: techHistory(order.techId, done) }
+  return { order, live: toLive(order, limits, now), stages, escalations: escalations.rows, history }
 }
 
 /**

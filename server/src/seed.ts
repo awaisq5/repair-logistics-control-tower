@@ -61,7 +61,9 @@ const TRANSIT: Record<string, number> = {
   Brazil: 10,
 }
 
-const MATERIALS = [
+// repairFactor: some tool types take longer in repair wherever they are sent,
+// e.g. because a test bench or a long-lead part is scarce.
+const MATERIALS: { material: string; value: number; repairFactor?: number }[] = [
   { material: 'Unit, hydraulic', value: 42_000 },
   { material: 'Valve, control', value: 18_000 },
   { material: 'Transformer, insert', value: 26_000 },
@@ -70,7 +72,7 @@ const MATERIALS = [
   { material: 'Electronics insert', value: 34_000 },
   { material: 'Battery pack', value: 6_500 },
   { material: 'Motor, power section', value: 39_000 },
-  { material: 'Steering unit', value: 145_000 },
+  { material: 'Steering unit', value: 145_000, repairFactor: 1.7 },
 ]
 
 const OWNERS = ['L. Haddad', 'M. Okonkwo', 'S. Ionescu', 'J. Becker', 'A. Mensah', 'R. Silva', 'K. Nurlan', 'D. Ortiz']
@@ -103,7 +105,7 @@ export function generateUnits(now: Date, count = 1400, seed = 20240815) {
       pending_at_sender: sender.pending,
       transit_to_hub: transit,
       gr_to_work_order: hub.grToWo,
-      in_repair: hub.repair,
+      in_repair: hub.repair * (m.repairFactor ?? 1),
       awaiting_outbound: hub.outbound,
       transit_from_hub: transit,
     }

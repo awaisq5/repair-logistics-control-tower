@@ -1,3 +1,4 @@
+import { MIN_TECH_LOOPS, STALL_RATIO, pastLoops, techHistory, type LoopRecord } from '../src/domain/history.js'
 import { describe, expect, it } from 'vitest'
 import { importCsv } from '../src/domain/importer.js'
 import { controlLimits, evaluateChart, limitsFor, MIN_GROUP_SIZE } from '../src/domain/spc.js'
@@ -106,5 +107,57 @@ describe('import', () => {
 
   it('names missing columns', () => {
     expect(importCsv('serial_no,tech_id\nA,B', now).issues[0].problem).toMatch(/Missing columns: material/)
+  })
+})
+
+describe('tool type history', () => {
+  const DAY = 86_400_000
+  const t0 = new Date('2026-01-01T00:00:00Z').getTime()
+  /** A completed loop with the given days per stage, starting `start` days after t0. */
+  function loop(id: number, techId: string, perStage: number[], start = 0, serialNo = `S${id}`): LoopRecord {
+    const fields = ['readyAt', 'dispatchedAt', 'hubReceivedAt', 'workOrderAt', 'repairedAt', 'hubDispatchedAt', 'returnedAt'] as const
+    let at = t0 + start * DAY
+    const dates: Record<string, Date> = { readyAt: new Date(at) }
+    perStage.forEach((d, i) => {
+      at += d * DAY
+      dates[fields[i + 1]] = new Date(at)
+    })
+    return { id, techId, serialNo, dates }
+  }
+  const normal = [10, 10, 5, 20, 5, 10]
+  const slowRepair = [10, 10, 5, 40, 5, 10]
+
+  it('flags a stage where a tool type takes far longer than the other tool types', () => {
+    const loops = [
+      ...Array.from({ length: 6 }, (_, i) => loop(i, 'TID-SLOW', slowRepair)),
+      ...Array.from({ length: 20 }, (_, i) => loop(100 + i, `TID-${i % 4}`, normal)),
+    ]
+    const h = techHistory('TID-SLOW', loops)
+    expect(h.loops).toBe(6)
+    const repair = h.stages.find((s) => s.stage === 'in_repair')!
+    expect(repair).toMatchObject({ techAvgDays: 40, othersAvgDays: 20, ratio: 2, stalls: true })
+    expect(h.stages.filter((s) => s.stalls)).toHaveLength(1)
+    expect(h.techAvgTotalDays).toBe(80)
+    expect(h.othersAvgTotalDays).toBe(60)
+  })
+
+  it(`needs ${MIN_TECH_LOOPS} completed loops before calling it a pattern`, () => {
+    const loops = [loop(1, 'TID-SLOW', slowRepair), ...Array.from({ length: 10 }, (_, i) => loop(10 + i, 'TID-A', normal))]
+    expect(techHistory('TID-SLOW', loops).stages.some((s) => s.stalls)).toBe(false)
+    expect(STALL_RATIO).toBe(1.5)
+  })
+
+  it('ignores open loops and handles a tool type with no history', () => {
+    const open = { id: 9, techId: 'TID-NEW', serialNo: 'S9', dates: { readyAt: new Date(t0) } }
+    const h = techHistory('TID-NEW', [open, loop(1, 'TID-A', normal)])
+    expect(h.loops).toBe(0)
+    expect(h.techAvgTotalDays).toBeNull()
+  })
+
+  it('lists earlier loops of the same serial number, newest first, without the current one', () => {
+    const loops = [loop(1, 'T', normal, 0, 'S-1'), loop(2, 'T', slowRepair, 100, 'S-1'), loop(3, 'T', normal, 200, 'S-1'), loop(4, 'T', normal, 0, 'S-2')]
+    const past = pastLoops('S-1', 3, loops)
+    expect(past.map((p) => p.id)).toEqual([2, 1])
+    expect(past[0]).toMatchObject({ totalDays: 80, longestStage: 'in_repair', longestDays: 40 })
   })
 })
