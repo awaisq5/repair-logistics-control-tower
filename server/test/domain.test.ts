@@ -1,4 +1,5 @@
 import { MIN_TECH_LOOPS, STALL_RATIO, pastLoops, techHistory, type LoopRecord } from '../src/domain/history.js'
+import { toCsv } from '../src/domain/csv.js'
 import { describe, expect, it } from 'vitest'
 import { importCsv } from '../src/domain/importer.js'
 import { controlLimits, evaluateChart, limitsFor, MIN_GROUP_SIZE } from '../src/domain/spc.js'
@@ -159,5 +160,12 @@ describe('tool type history', () => {
     const past = pastLoops('S-1', 3, loops)
     expect(past.map((p) => p.id)).toEqual([2, 1])
     expect(past[0]).toMatchObject({ totalDays: 80, longestStage: 'in_repair', longestDays: 40 })
+  })
+})
+
+describe('toCsv', () => {
+  it('quotes only cells that need it and keeps accents with a byte order mark', () => {
+    const csv = toCsv(['a', 'b', 'c'], [['Société Générale', 'say "hi"', 3], [null, true, 'two\nlines']])
+    expect(csv).toBe('﻿a,b,c\r\nSociété Générale,"say ""hi""",3\r\n,yes,"two\nlines"\r\n')
   })
 })

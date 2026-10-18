@@ -45,7 +45,7 @@ A unit above its UCL has been in its stage longer than that lane's normal variat
 - **Live view.** Units and value in each of the six stages, the average days pending and in transit by country (the two live charts of the original dashboard), and every unit beyond its limit.
 - **Lanes.** Average days per stage for every country-to-hub lane, stacked, so you can see whether a lane is slow because of the sending country, the road, or the hub.
 - **Control charts.** The I-chart per stage, grouped by country, lane or hub, with special causes highlighted and a week-by-week count of units beyond their limit.
-- **Escalations.** A scan, run every 15 minutes and on demand, opens one escalation per unit beyond its limit and suggests the regional logistics owner for that location. Recording the unit's next movement closes the escalation and counts its value as working capital moving again.
+- **Escalations.** A scan, run every 15 minutes and on demand, opens one escalation per unit beyond its limit and suggests the regional logistics owner for that location. Recording the unit's next movement closes the escalation and counts its value as working capital moving again. The queue downloads as CSV for the weekly call with the regional teams.
 - **Tool type history.** The unit detail compares the tech ID's completed loops with all other tool types, stage by stage, across every lane. A stage where it takes 1.5× as long or more, over at least five loops, is flagged: the tool type keeps stalling there, whatever the lane. Earlier loops of the same serial number are listed too. In the demo, steering units take longer in repair at every hub.
 - **Load data.** Upload a movement export with seven dates per unit. Every row is checked first: dates out of order, gaps in the chain, future dates, a serial open twice. Problems are listed by row and never loaded. German date formats (05.03.2026) are accepted, as SAP exports often use them.
 
@@ -80,6 +80,7 @@ Design decisions:
 | GET | `/api/lanes` | Average days per stage for each country-to-hub lane |
 | GET | `/api/control-chart/:stage` | I-chart points and limits for each group |
 | GET | `/api/escalations` | Active escalations with the suggested regional owner |
+| GET | `/api/escalations.csv` | The active queue as CSV for the weekly regional call, with days in stage as of today |
 | POST | `/api/escalations/scan` | Open escalations for units beyond their limit |
 | POST | `/api/escalations/:id/acknowledge` | Take ownership `{ owner, note? }` |
 | POST | `/api/escalations/:id/resolve` | Close with a note `{ note }` |
