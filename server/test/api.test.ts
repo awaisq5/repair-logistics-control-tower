@@ -77,6 +77,22 @@ describe.skipIf(!url)('API', () => {
     expect(esc).toMatchObject({ serialNo: 'LIVE1', status: 'open', regionOwner: 'L. Haddad', valueEur: 48000 })
   })
 
+  it('exports the active queue as CSV with days in stage as of today', async () => {
+    await setRegionContacts(pool, { Egypt: 'L. Haddad' })
+    await load([...history([10, 12, 9, 11, 10, 13, 9, 12, 11, 10]), `LIVE1,TID-1,"Valve, 6 3/4in",48000,Egypt,Base,UAE,Hub,Egypt,${iso(40)},,,,,,`])
+    await request(app()).post('/api/escalations/scan')
+    clock = new Date(clock.getTime() + 5 * DAY)
+
+    const res = await request(app()).get('/api/escalations.csv').expect(200)
+    expect(res.headers['content-type']).toMatch(/^text\/csv/)
+    expect(res.headers['content-disposition']).toBe('attachment; filename=escalations-2026-06-06.csv')
+    expect(res.text.charCodeAt(0)).toBe(0xfeff)
+    const [header, row, end] = res.text.slice(1).split('\r\n')
+    expect(header.split(',')).toContain('days_in_stage_today')
+    expect(row).toMatch(/^LIVE1,TID-1,"Valve, 6 3\/4in",Waiting to ship at sending location,Egypt,41,46,\d+,48000,open,,L\. Haddad,2026-06-01,$/)
+    expect(end).toBe('')
+  })
+
   it('moving the unit on resolves its escalation and counts the value as released', async () => {
     await load([...history([10, 12, 9, 11, 10, 13, 9, 12, 11, 10]), `LIVE1,TID-1,Valve,48000,Egypt,Base,UAE,Hub,Egypt,${iso(40)},,,,,,`])
     await request(app()).post('/api/escalations/scan')

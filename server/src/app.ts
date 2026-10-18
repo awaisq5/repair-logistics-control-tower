@@ -4,8 +4,9 @@ import path from 'node:path'
 import type pg from 'pg'
 import { z } from 'zod'
 import { controlChart, laneBreakdown, overview } from './analytics.js'
+import { toCsv } from './domain/csv.js'
 import { DATE_COLUMNS, REQUIRED_COLUMNS, importCsv } from './domain/importer.js'
-import { DATE_FIELDS, STAGES, STAGE_INFO } from './domain/stages.js'
+import { DATE_FIELDS, STAGES, STAGE_BY_ID, STAGE_INFO } from './domain/stages.js'
 import {
   ConflictError,
   NotFoundError,
@@ -102,6 +103,54 @@ export function createApp({ pool, now = () => new Date(), clientDir }: AppOption
 
   api.get('/escalations', async (req, res) => {
     res.json(await listEscalations(pool, req.query.status === 'resolved' ? 'resolved' : 'active'))
+  })
+
+  /** The active queue for the weekly call with regional owners, with today's days in stage. */
+  api.get('/escalations.csv', async (_req, res) => {
+    const at = now()
+    const [escalations, units] = await Promise.all([listEscalations(pool, 'active'), liveUnits(pool, at)])
+    const live = new Map(units.map((u) => [u.id, u]))
+    const day = (d: Date | string | null) => (d ? new Date(d).toISOString().slice(0, 10) : '')
+    const rows = escalations.map((e) => {
+      const u = live.get(e.repairOrderId)
+      // Days are only "today" while the unit is still in the escalated stage.
+      const still = u?.stage === e.stage ? u : undefined
+      return [
+        e.serialNo,
+        e.techId,
+        e.material,
+        STAGE_BY_ID[e.stage]?.label ?? e.stage,
+        e.groupKey,
+        Math.round(Number(e.daysAtOpen)),
+        still ? Math.round(still.daysInStage) : '',
+        Math.round(Number(e.limitDays)),
+        Math.round(Number(e.valueEur)),
+        e.status,
+        e.owner,
+        e.regionOwner,
+        day(e.openedAt),
+        e.note,
+      ]
+    })
+    const header = [
+      'serial_no',
+      'tech_id',
+      'material',
+      'stage',
+      'lane_or_group',
+      'days_at_escalation',
+      'days_in_stage_today',
+      'limit_days',
+      'value_eur',
+      'status',
+      'owner',
+      'suggested_regional_owner',
+      'escalated_on',
+      'notes',
+    ]
+    res.type('text/csv; charset=utf-8')
+    res.attachment(`escalations-${day(at)}.csv`)
+    res.send(toCsv(header, rows))
   })
 
   api.post('/escalations/scan', async (_req, res) => {

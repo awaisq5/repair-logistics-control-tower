@@ -1,3 +1,4 @@
+import { toCsv } from '../src/domain/csv.js'
 import { describe, expect, it } from 'vitest'
 import { importCsv } from '../src/domain/importer.js'
 import { controlLimits, evaluateChart, limitsFor, MIN_GROUP_SIZE } from '../src/domain/spc.js'
@@ -106,5 +107,12 @@ describe('import', () => {
 
   it('names missing columns', () => {
     expect(importCsv('serial_no,tech_id\nA,B', now).issues[0].problem).toMatch(/Missing columns: material/)
+  })
+})
+
+describe('toCsv', () => {
+  it('quotes only cells that need it and keeps accents with a byte order mark', () => {
+    const csv = toCsv(['a', 'b', 'c'], [['Société Générale', 'say "hi"', 3], [null, true, 'two\nlines']])
+    expect(csv).toBe('﻿a,b,c\r\nSociété Générale,"say ""hi""",3\r\n,yes,"two\nlines"\r\n')
   })
 })
